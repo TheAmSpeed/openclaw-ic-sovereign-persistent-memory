@@ -18,31 +18,45 @@ IC Sovereign Persistent Memory gives you sovereign, persistent AI memory storage
 
 ## Key Concepts
 
-- **Vault**: Your personal canister on the Internet Computer. Only you can read/write it.
-- **Sync**: Local memories auto-sync to your vault in the background. If the IC is unreachable, nothing breaks -- it syncs on reconnect.
+- **Vault**: Your personal canister on the Internet Computer. Only your Ed25519 identity can read or write it.
+- **Identity**: An Ed25519 key pair stored in your OS keychain (macOS Keychain / Linux Secret Service). Fallback: AES-256-GCM encrypted file with passphrase. No browser or seed phrases required.
+- **Sync**: Memories sync to your vault via differential comparison (only changed entries are uploaded). If the IC is unreachable, nothing breaks -- it syncs on reconnect.
 - **Audit Log**: Every operation is recorded in an immutable, consensus-verified log. No one (not even you) can modify past entries.
-- **Internet Identity**: Authentication via Google, Apple, Microsoft, or passkey. No seed phrases or wallet setup required.
+- **Factory**: A shared canister that creates personal vaults. Each vault is a separate canister with its own cycle balance.
 
 ## Setup
 
-To create your vault, run:
+To create your identity and vault, run:
 
 ```bash
 openclaw ic-memory setup
 ```
 
-This opens Internet Identity 2.0 in your browser. After authenticating, a personal vault canister is created for you on the IC.
+This does three things (no browser needed):
+1. Generates an Ed25519 key pair and stores it in your OS keychain
+2. Checks if you already have a vault on the IC
+3. If not, creates a new personal vault canister via the Factory
+
+After setup, configure your vault ID:
+
+```bash
+openclaw config set plugins.entries.openclaw-ic-sovereign-persistent-memory.config.canisterId "<your-vault-id>"
+```
+
+The setup command prints the exact command to run.
 
 ## Available Commands
 
 ### CLI Commands
 
 ```bash
-openclaw ic-memory setup     # Authenticate + create vault
-openclaw ic-memory status    # Show vault stats (memories, sessions, cycles)
-openclaw ic-memory sync      # Manual sync to IC
-openclaw ic-memory restore   # Restore all data from IC to local
-openclaw ic-memory audit     # Show immutable audit log
+openclaw ic-memory setup            # Generate identity + create vault
+openclaw ic-memory status           # Show vault stats (memories, sessions, cycles)
+openclaw ic-memory sync             # Manual sync to IC
+openclaw ic-memory restore          # Restore all data from IC to local
+openclaw ic-memory audit            # Show immutable audit log
+openclaw ic-memory export-identity  # Export identity key for cross-device use
+openclaw ic-memory import-identity  # Import identity from another device (reads from stdin)
 ```
 
 ### Agent Tools
@@ -59,21 +73,37 @@ Note: Deletion is available via the canister API for advanced users but is inten
 
 ## How It Works
 
-1. Your local AI memories (SQLite/LanceDB) remain the primary store for instant reads/writes.
-2. The IC vault syncs in the background as a persistent backup.
-3. Each sync uses differential comparison -- only changed entries are uploaded.
+1. OpenClaw creates memories about you and your projects during conversations (preferences, decisions, project context).
+2. This plugin replaces the built-in memory storage -- instead of saving locally, memories go to your IC vault canister.
+3. Each sync uses differential comparison via a SyncManifest -- only changed entries are uploaded.
 4. The vault canister uses Enhanced Orthogonal Persistence (EOP) for automatic data persistence across canister upgrades.
 5. Every write goes through IC consensus (replicated across multiple nodes), making the audit log tamper-proof.
 
-## Cross-Device Restore
+## Cross-Device Setup
 
-To restore memories on a new device:
+To use your vault on a new device:
+
+**On your current device:**
+
+```bash
+openclaw ic-memory export-identity
+```
+
+This prints your secret key (base64). Store it securely (password manager, encrypted note).
+
+**On the new device:**
+
+```bash
+openclaw ic-memory import-identity
+```
+
+Paste the key when prompted (input is hidden). The identity is saved to the OS keychain on the new device. Then run `openclaw ic-memory setup` to detect your existing vault, or restore all data:
 
 ```bash
 openclaw ic-memory restore
 ```
 
-This authenticates with Internet Identity, finds your vault, and downloads all memories and sessions.
+**Security note:** The import command reads the key from stdin, never as a CLI argument (avoids shell history leaks).
 
 ## Configuration
 
@@ -90,11 +120,13 @@ Config lives under `plugins.entries.openclaw-ic-sovereign-persistent-memory.conf
 
 ## Security
 
-- Every call to your vault is cryptographically signed.
-- The IC verifies `msg.caller` before your canister code runs.
-- Knowing someone's principal ID is useless without their private key.
-- Private keys never leave your device (WebAuthn/passkey hardware-backed).
-- The vault is controlled by your Internet Identity principal -- no one else can access it.
+- **Identity storage**: Ed25519 private key stored in OS keychain (macOS Keychain / Linux Secret Service). Fallback: AES-256-GCM encrypted file with PBKDF2-derived key (600,000 iterations).
+- **Caller verification**: Every call to your vault is cryptographically signed. The IC verifies `msg.caller` matches the vault owner before any code runs.
+- **Principal isolation**: Knowing someone's principal ID is useless without their Ed25519 private key.
+- **No plaintext keys on disk**: Keys are in the OS keychain (encrypted by login password). The encrypted file fallback never stores plaintext.
+- **Import safety**: `import-identity` reads from stdin (hidden input), never from CLI arguments (avoids shell history leaks).
+- **Secure delete**: When an identity is removed, the key file is overwritten with random bytes, then zeros, before unlinking.
+- **Immutable audit**: Every store, delete, and sync is logged with consensus-verified timestamps. The log is append-only.
 
 ## Cost
 

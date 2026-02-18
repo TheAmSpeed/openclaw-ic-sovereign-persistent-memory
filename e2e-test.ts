@@ -41,6 +41,9 @@ async function main() {
     factoryCanisterId: FACTORY_CANISTER_ID,
     canisterId: undefined as unknown as string, // will be set after vault creation
     network: "ic",
+    autoSync: true,
+    syncOnSessionEnd: true,
+    syncOnAgentEnd: true,
   });
 
   await client.initAgentWithIdentity(identity);
