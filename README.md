@@ -18,7 +18,7 @@ Then create your vault:
 openclaw ic-memory setup
 ```
 
-That's it. Internet Identity opens in your browser, you sign in (Google, Apple, Microsoft, or passkey), and a personal vault canister is deployed on the Internet Computer in about 10 seconds.
+That's it. A new Ed25519 identity is generated and stored in your OS keychain, and a personal vault canister is deployed on the Internet Computer in about 10 seconds. No browser needed.
 
 ## Why
 
@@ -33,11 +33,11 @@ This plugin gives you persistent, sovereign backup:
 
 | Feature | How it works |
 |---|---|
-| **Sovereign ownership** | Your vault is a personal canister. Only your Internet Identity principal can read or write it. Not even the factory deployer has access. |
+| **Sovereign ownership** | Your vault is a personal canister. Only your Ed25519 identity principal can read or write it. Not even the factory deployer has access. |
 | **Differential sync** | Only changed entries are uploaded. Sync is fast and bandwidth-efficient. |
 | **Cross-device restore** | Run `openclaw ic-memory restore` on any device to pull all your memories down. |
 | **Immutable audit log** | Every operation is recorded with IC consensus-verified timestamps. The log is append-only and tamper-proof. |
-| **No seed phrases** | Authentication uses Internet Identity 2.0 (WebAuthn/passkey). Sign in with Google, Apple, Microsoft, or a hardware key. |
+| **No seed phrases** | Authentication uses an Ed25519 key pair stored in your OS keychain (macOS Keychain / Linux Secret Service). No browser, no passwords to remember. |
 | **Auto-sync** | Memories sync automatically when conversations end. No manual steps required. |
 
 ## Architecture
@@ -46,10 +46,10 @@ This plugin gives you persistent, sovereign backup:
 Local Device                          Internet Computer (IC)
 +------------------+                  +---------------------+
 |  OpenClaw        |                  |  Factory Canister   |
-|  (SQLite/LanceDB)|   bulkSync()    |  v7tpn-laaaa-...    |
-|  Primary store   | --------------> |  Creates user vaults|
-|  for reads/writes|                  +---------------------+
-+------------------+                          |
+|  Memory system   |   bulkSync()    |  v7tpn-laaaa-...    |
+|  (local store)   | --------------> |  Creates user vaults|
++------------------+                  +---------------------+
+        |                                     |
         |                              createVault()
         |                                     |
         v                                     v
@@ -58,12 +58,18 @@ Local Device                          Internet Computer (IC)
 |  Differential    | <-------------- |  (Personal Canister)|
 |  sync engine     |                  |  Owner-only access  |
 +------------------+                  |  EOP persistence    |
-                                      |  Audit log          |
-                                      +---------------------+
+        |                             |  Audit log          |
+        v                             +---------------------+
++------------------+
+|  OS Keychain     |
+|  Ed25519 identity|
+|  (or AES-256-GCM |
+|   encrypted file)|
++------------------+
 ```
 
-- **Local remains primary.** Reads and writes happen against SQLite/LanceDB for instant performance.
 - **IC is the persistent backup.** The vault syncs in the background. If the IC is unreachable, nothing breaks -- it syncs on reconnect.
+- **Identity in OS keychain.** Your Ed25519 private key is stored in macOS Keychain or Linux Secret Service. Fallback: AES-256-GCM encrypted file with passphrase.
 - **Enhanced Orthogonal Persistence (EOP)** means your data survives canister upgrades automatically. No migration scripts.
 
 ## Commands
@@ -71,11 +77,13 @@ Local Device                          Internet Computer (IC)
 ### CLI
 
 ```bash
-openclaw ic-memory setup     # Authenticate + create vault
-openclaw ic-memory status    # Show vault stats (memories, sessions, cycles)
-openclaw ic-memory sync      # Manual sync to IC
-openclaw ic-memory restore   # Restore all data from IC to local
-openclaw ic-memory audit     # Show immutable audit log
+openclaw ic-memory setup            # Generate identity + create vault
+openclaw ic-memory status           # Show vault stats (memories, sessions, cycles)
+openclaw ic-memory sync             # Manual sync to IC
+openclaw ic-memory restore          # Restore all data from IC to local
+openclaw ic-memory audit            # Show immutable audit log
+openclaw ic-memory export-identity  # Export identity for cross-device use
+openclaw ic-memory import-identity  # Import identity from another device (stdin)
 ```
 
 ### Agent Tools
@@ -107,12 +115,44 @@ Environment variables are supported: `canisterId: "${MY_CANISTER_ID}"` resolves 
 
 ## Security Model
 
-- Every call to your vault is cryptographically signed by your identity.
-- The IC runtime verifies `msg.caller` before your canister code executes.
-- Knowing someone's principal ID is useless without their private key.
-- Private keys never leave your device (WebAuthn/passkey, hardware-backed).
-- The vault canister's `owner` field is set at creation and enforced on every update call.
-- The factory canister cannot read, modify, or delete your vault data.
+- **Identity storage**: Ed25519 private key in OS keychain (macOS Keychain / Linux Secret Service). Fallback: AES-256-GCM encrypted file with PBKDF2-derived key (600,000 iterations).
+- **Caller verification**: Every call to your vault is cryptographically signed. The IC verifies `msg.caller` matches the vault owner before any code runs.
+- **Principal isolation**: Knowing someone's principal ID is useless without their Ed25519 private key.
+- **No plaintext keys on disk**: Keys are in the OS keychain (encrypted by login password). The encrypted file fallback never stores plaintext.
+- **Import safety**: `import-identity` reads from stdin (hidden input), never from CLI arguments (avoids shell history leaks).
+- **Secure delete**: When an identity is removed, the key file is overwritten with random bytes, then zeros, before unlinking.
+- **Factory isolation**: The factory canister cannot read, modify, or delete your vault data. After creation, you can revoke the factory's controller access entirely.
+- **Immutable audit**: Every store, delete, and sync is logged with consensus-verified timestamps. The log is append-only.
+
+## Cross-Device Setup
+
+To use your vault on another device:
+
+**On your current device:**
+
+```bash
+openclaw ic-memory export-identity
+```
+
+This prints your secret key (base64). Store it securely (password manager, encrypted note).
+
+**On the new device:**
+
+```bash
+openclaw ic-memory import-identity
+```
+
+Paste the key when prompted (input is hidden, never passed as a CLI argument). Then run setup to detect your existing vault:
+
+```bash
+openclaw ic-memory setup
+```
+
+Or restore all data directly:
+
+```bash
+openclaw ic-memory restore
+```
 
 ## Cost
 
@@ -155,10 +195,12 @@ To test against a local IC replica:
 ```
 index.ts              Plugin entry point (tools, hooks, CLI, service)
 config.ts             Config types and parser
-ic-client.ts          @dfinity/agent wrapper (auth, canister calls)
+ic-client.ts          @dfinity/agent wrapper (identity loading, canister calls)
+identity.ts           Ed25519 identity management (keychain, encrypted file, import/export)
 sync.ts               Differential sync engine
 prompts.ts            Smart adoption messaging
-index.test.ts         Test suite
+index.test.ts         Test suite (73 tests)
+e2e-test.ts           End-to-end test against IC mainnet (13 tests)
 openclaw.plugin.json  Plugin manifest
 skills/ic-storage/    Bundled skill (SKILL.md)
 canister/             Motoko canister source (Factory + UserVault)
@@ -166,7 +208,7 @@ canister/             Motoko canister source (Factory + UserVault)
 
 ## Known Limitations
 
-- Auto-sync hooks (`session_end`, `agent_end`) are wired but pending Phase 2 integration with OpenClaw's `MemorySearchManager` to pull actual local memories. Manual sync via `vault_sync` tool or `openclaw ic-memory sync` works now.
+- Auto-sync hooks (`session_end`, `agent_end`) are wired and trigger a manifest check. Full `MemorySearchManager` integration (auto-pulling local memories for sync) is planned for v1.1. Manual sync via `vault_sync` tool or `openclaw ic-memory sync` works now.
 - The `vault_delete` agent tool is intentionally omitted. Deletion is available via the canister API for advanced users, but the agent encourages an append-friendly workflow.
 - Audit log entries are capped at 100,000 with FIFO eviction of the oldest 10% when full.
 
