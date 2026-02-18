@@ -1,17 +1,18 @@
 import Types "Types";
-import Array "mo:base/Array";
-import Nat "mo:base/Nat";
-import Int "mo:base/Int";
-import Text "mo:base/Text";
-import Time "mo:base/Time";
-import Trie "mo:base/Trie";
-import Result "mo:base/Result";
-import Principal "mo:base/Principal";
-import ExperimentalCycles "mo:base/ExperimentalCycles";
-
+import Array "mo:core/Array";
+import Int "mo:core/Int";
+import List "mo:core/List";
+import Map "mo:core/Map";
+import Nat "mo:core/Nat";
+import Result "mo:core/Result";
+import Text "mo:core/Text";
+import Time "mo:core/Time";
+import Cycles "mo:core/Cycles";
+import Principal "mo:core/Principal";
 
 /// Per-user persistent vault canister.
-/// Uses Trie (functional, stable) for maps, arrays for audit log (EOP-compatible).
+/// Uses Map (mutable B-tree, order 32) for key-value lookups.
+/// Uses List (Brodnik resizable array) for the audit log -- amortized O(1) append, O(1) random access.
 /// All vars persist across upgrades via Enhanced Orthogonal Persistence.
 persistent actor class UserVault(initOwner : Principal) {
 
@@ -28,37 +29,28 @@ persistent actor class UserVault(initOwner : Principal) {
   let MAX_AUDIT_LOG_SIZE : Nat = 100_000;
 
   // -- State --
-  // All vars implicitly stable (EOP). Using Trie for stable key-value maps.
+  // All vars implicitly stable (EOP). Map and List are stable types.
 
   let owner : Principal = initOwner;
 
-  var memories : Trie.Trie<Text, Types.MemoryEntry> = Trie.empty();
-  var sessions : Trie.Trie<Text, Types.SessionEntry> = Trie.empty();
+  // Mutable B-tree maps -- add/remove/get mutate in-place, no reassignment needed.
+  var memories : Map.Map<Text, Types.MemoryEntry> = Map.empty<Text, Types.MemoryEntry>();
+  var sessions : Map.Map<Text, Types.SessionEntry> = Map.empty<Text, Types.SessionEntry>();
 
-  // Immutable audit log -- append-only, never modified.
-  // Stored as a stable array for EOP (Enhanced Orthogonal Persistence) compatibility.
-  var auditLog : [Types.AuditEntry] = [];
+  // Immutable audit log -- append-only, never modified (except FIFO eviction of oldest entries).
+  // List provides amortized O(1) append, O(1) random access, and is a stable type.
+  var auditLog : List.List<Types.AuditEntry> = List.empty<Types.AuditEntry>();
 
   var lastUpdated : Int = 0;
-
-  // Track sizes separately for O(1) lookups (Trie doesn't have a .size() method)
-  var memoriesCount : Nat = 0;
-  var sessionsCount : Nat = 0;
 
   // Running bytesUsed counter -- maintained incrementally instead of O(n) recompute
   var bytesUsed : Nat = 0;
 
   // Category counts -- maintained incrementally instead of O(n) recompute
-  var categoryCounts : Trie.Trie<Text, Nat> = Trie.empty();
+  var categoryCounts : Map.Map<Text, Nat> = Map.empty<Text, Nat>();
 
   // Category max updatedAt -- maintained incrementally for O(1) categoryChecksum
-  var categoryMaxUpdated : Trie.Trie<Text, Int> = Trie.empty();
-
-  // -- Trie key helpers --
-
-  func textKey(t : Text) : Trie.Key<Text> {
-    { key = t; hash = Text.hash(t) };
-  };
+  var categoryMaxUpdated : Map.Map<Text, Int> = Map.empty<Text, Int>();
 
   // -- Internal helpers --
 
@@ -74,22 +66,22 @@ persistent actor class UserVault(initOwner : Principal) {
 
   /// Increment category count for a category.
   func incrementCategory(category : Text) {
-    let current = switch (Trie.get(categoryCounts, textKey(category), Text.equal)) {
+    let current = switch (Map.get(categoryCounts, Text.compare, category)) {
       case (?n) { n };
       case null { 0 };
     };
-    categoryCounts := Trie.put(categoryCounts, textKey(category), Text.equal, current + 1).0;
+    Map.add(categoryCounts, Text.compare, category, current + 1);
   };
 
   /// Decrement category count for a category. Removes entry if count reaches 0.
   func decrementCategory(category : Text) {
-    switch (Trie.get(categoryCounts, textKey(category), Text.equal)) {
+    switch (Map.get(categoryCounts, Text.compare, category)) {
       case (?n) {
         if (n <= 1) {
-          categoryCounts := Trie.remove(categoryCounts, textKey(category), Text.equal).0;
-          categoryMaxUpdated := Trie.remove(categoryMaxUpdated, textKey(category), Text.equal).0;
+          Map.remove(categoryCounts, Text.compare, category);
+          Map.remove(categoryMaxUpdated, Text.compare, category);
         } else {
-          categoryCounts := Trie.put(categoryCounts, textKey(category), Text.equal, n - 1).0;
+          Map.add(categoryCounts, Text.compare, category, n - 1);
         };
       };
       case null {}; // shouldn't happen, but defensive
@@ -98,12 +90,12 @@ persistent actor class UserVault(initOwner : Principal) {
 
   /// Update the max updatedAt for a category if the given timestamp is newer.
   func updateCategoryMaxUpdated(category : Text, updatedAt : Int) {
-    let current = switch (Trie.get(categoryMaxUpdated, textKey(category), Text.equal)) {
+    let current = switch (Map.get(categoryMaxUpdated, Text.compare, category)) {
       case (?ts) { ts };
       case null { 0 };
     };
     if (updatedAt > current) {
-      categoryMaxUpdated := Trie.put(categoryMaxUpdated, textKey(category), Text.equal, updatedAt).0;
+      Map.add(categoryMaxUpdated, Text.compare, category, updatedAt);
     };
   };
 
@@ -111,40 +103,43 @@ persistent actor class UserVault(initOwner : Principal) {
   /// Only needed on delete when the deleted entry might have been the max.
   func recomputeCategoryMaxUpdated(category : Text) {
     var maxUpdated : Int = 0;
-    for ((_, entry) in Trie.iter(memories)) {
+    for ((_, entry) in Map.entries(memories)) {
       if (entry.category == category and entry.updatedAt > maxUpdated) {
         maxUpdated := entry.updatedAt;
       };
     };
     if (maxUpdated > 0) {
-      categoryMaxUpdated := Trie.put(categoryMaxUpdated, textKey(category), Text.equal, maxUpdated).0;
+      Map.add(categoryMaxUpdated, Text.compare, category, maxUpdated);
     } else {
-      categoryMaxUpdated := Trie.remove(categoryMaxUpdated, textKey(category), Text.equal).0;
+      Map.remove(categoryMaxUpdated, Text.compare, category);
     };
   };
 
   /// Get unique categories from the tracked category counts in O(c) where c = number of categories.
   func getUniqueCategories() : [Text] {
-    Trie.toArray<Text, Nat, Text>(categoryCounts, func(k, _) { k });
+    Array.fromIter<Text>(Map.keys(categoryCounts));
   };
 
   /// Append an entry to the immutable audit log with FIFO eviction.
-  /// Uses Array.append (O(n) per call) but amortized by 10% batch eviction.
-  /// Buffer.Buffer is not a stable type in persistent actors (EOP), so we use arrays.
+  /// Uses List.add for amortized O(1) append.
+  /// On eviction, rebuilds the list from a slice to remove the oldest 10%.
   func appendAudit(entry : Types.AuditEntry) {
     // FIFO eviction: if at max size, remove oldest 10% to amortize
-    if (auditLog.size() >= MAX_AUDIT_LOG_SIZE) {
+    if (List.size(auditLog) >= MAX_AUDIT_LOG_SIZE) {
       let evictCount = MAX_AUDIT_LOG_SIZE / 10; // remove 10%
       // Decrement bytesUsed for evicted entries
       let evictedBytes = evictCount * 128;
       bytesUsed := if (bytesUsed >= evictedBytes) { bytesUsed - evictedBytes } else { 0 };
 
-      let remaining = auditLog.size() - evictCount;
-      auditLog := Array.tabulate<Types.AuditEntry>(remaining, func(i) {
-        auditLog[evictCount + i];
-      });
+      // Rebuild list from remaining entries (skip oldest evictCount)
+      let size = List.size(auditLog);
+      let newLog = List.empty<Types.AuditEntry>();
+      for (i in Nat.range(evictCount, size)) {
+        List.add(newLog, List.at(auditLog, i));
+      };
+      auditLog := newLog;
     };
-    auditLog := Array.append(auditLog, [entry]);
+    List.add(auditLog, entry);
     // Update bytesUsed estimate for audit entries
     bytesUsed += 128;
   };
@@ -182,21 +177,18 @@ persistent actor class UserVault(initOwner : Principal) {
   /// Build VaultStats in O(c) where c = number of categories (not O(n) over all entries).
   func buildStats() : Types.VaultStats {
     {
-      totalMemories = memoriesCount;
-      totalSessions = sessionsCount;
+      totalMemories = Map.size(memories);
+      totalSessions = Map.size(sessions);
       categories = getUniqueCategories();
       bytesUsed = bytesUsed;
-      cycleBalance = ExperimentalCycles.balance();
+      cycleBalance = Cycles.balance();
       lastUpdated = lastUpdated;
     };
   };
 
   /// Get recent memories sorted by updatedAt (most recent first), limited.
   func getRecentMemories(limit : Nat) : [Types.MemoryEntry] {
-    let all = Trie.toArray<Text, Types.MemoryEntry, Types.MemoryEntry>(
-      memories,
-      func(_, v) { v },
-    );
+    let all = Array.fromIter<Types.MemoryEntry>(Map.values(memories));
     let sorted = Array.sort<Types.MemoryEntry>(all, func(a, b) {
       if (a.updatedAt > b.updatedAt) { #less }
       else if (a.updatedAt < b.updatedAt) { #greater }
@@ -208,10 +200,7 @@ persistent actor class UserVault(initOwner : Principal) {
 
   /// Get recent sessions sorted by startedAt (most recent first), limited.
   func getRecentSessions(limit : Nat) : [Types.SessionEntry] {
-    let all = Trie.toArray<Text, Types.SessionEntry, Types.SessionEntry>(
-      sessions,
-      func(_, v) { v },
-    );
+    let all = Array.fromIter<Types.SessionEntry>(Map.values(sessions));
     let sorted = Array.sort<Types.SessionEntry>(all, func(a, b) {
       if (a.startedAt > b.startedAt) { #less }
       else if (a.startedAt < b.startedAt) { #greater }
@@ -222,13 +211,13 @@ persistent actor class UserVault(initOwner : Principal) {
   };
 
   /// Simple checksum for a category's entries: count:maxUpdatedAt.
-  /// O(1) using incrementally maintained categoryCounts and categoryMaxUpdated Tries.
+  /// O(1) using incrementally maintained categoryCounts and categoryMaxUpdated Maps.
   func categoryChecksum(category : Text) : Text {
-    let count = switch (Trie.get(categoryCounts, textKey(category), Text.equal)) {
+    let count = switch (Map.get(categoryCounts, Text.compare, category)) {
       case (?n) { n };
       case null { 0 };
     };
-    let maxUpdated = switch (Trie.get(categoryMaxUpdated, textKey(category), Text.equal)) {
+    let maxUpdated = switch (Map.get(categoryMaxUpdated, Text.compare, category)) {
       case (?ts) { ts };
       case null { 0 };
     };
@@ -258,7 +247,7 @@ persistent actor class UserVault(initOwner : Principal) {
     };
 
     let now = Time.now();
-    let existing = Trie.get(memories, textKey(key), Text.equal);
+    let existing = Map.get(memories, Text.compare, key);
     let createdAt = switch (existing) {
       case (?e) { e.createdAt };
       case null { now };
@@ -273,13 +262,13 @@ persistent actor class UserVault(initOwner : Principal) {
       updatedAt = now;
     };
 
-    let (newMemories, old) = Trie.put(memories, textKey(key), Text.equal, newEntry);
-    memories := newMemories;
+    // Map.add replaces existing key if present. Use Map.take to get old value first.
+    let old = Map.take(memories, Text.compare, key);
+    Map.add(memories, Text.compare, key, newEntry);
 
     // Update counts, bytesUsed, and categoryMaxUpdated
     switch (old) {
       case null {
-        memoriesCount += 1;
         incrementCategory(category);
         bytesUsed += memoryEntrySize(newEntry);
       };
@@ -287,7 +276,7 @@ persistent actor class UserVault(initOwner : Principal) {
         // Category may have changed
         if (oldEntry.category != category) {
           // Decrement old category and recompute its max if entries remain
-          let oldCatCount = switch (Trie.get(categoryCounts, textKey(oldEntry.category), Text.equal)) {
+          let oldCatCount = switch (Map.get(categoryCounts, Text.compare, oldEntry.category)) {
             case (?n) { n };
             case null { 0 };
           };
@@ -330,29 +319,27 @@ persistent actor class UserVault(initOwner : Principal) {
       return #err(#unauthorized);
     };
 
-    let existing = Trie.get(memories, textKey(key), Text.equal);
-    switch (existing) {
-      case (?removed) {
-        let (newMemories, _) = Trie.remove(memories, textKey(key), Text.equal);
-        memories := newMemories;
-
-        // Defensive underflow protection
-        if (memoriesCount > 0) { memoriesCount -= 1 };
+    // Map.take removes the key and returns the old value if present
+    let removed = Map.take(memories, Text.compare, key);
+    switch (removed) {
+      case (?entry) {
+        // Defensive underflow not needed: Map.size is authoritative.
+        // But track category counts.
 
         // decrementCategory removes categoryMaxUpdated if count reaches 0;
         // otherwise recompute since deleted entry may have been the max.
-        let catCount = switch (Trie.get(categoryCounts, textKey(removed.category), Text.equal)) {
+        let catCount = switch (Map.get(categoryCounts, Text.compare, entry.category)) {
           case (?n) { n };
           case null { 0 };
         };
-        decrementCategory(removed.category);
+        decrementCategory(entry.category);
         if (catCount > 1) {
-          // Category still has entries — recompute max since we may have removed the max entry
-          recomputeCategoryMaxUpdated(removed.category);
+          // Category still has entries -- recompute max since we may have removed the max entry
+          recomputeCategoryMaxUpdated(entry.category);
         };
 
         // Adjust bytesUsed
-        let removedSize = memoryEntrySize(removed);
+        let removedSize = memoryEntrySize(entry);
         bytesUsed := if (bytesUsed >= removedSize) { bytesUsed - removedSize } else { 0 };
 
         let now = Time.now();
@@ -362,7 +349,7 @@ persistent actor class UserVault(initOwner : Principal) {
           action = #delete;
           caller = caller;
           key = ?key;
-          category = ?removed.category;
+          category = ?entry.category;
           details = null;
         });
         #ok(());
@@ -386,28 +373,24 @@ persistent actor class UserVault(initOwner : Principal) {
     var errors : [Text] = [];
 
     // Sync memories
-    for (input in memoryInputs.vals()) {
+    for (input in memoryInputs.values()) {
       if (input.key == "" or input.category == "") {
-        errors := Array.append(errors, ["Skipped memory with empty key or category"]);
+        errors := Array.concat(errors, ["Skipped memory with empty key or category"]);
         skipped += 1;
       } else {
         // Validate input sizes
         switch (validateMemoryInput(input.key, input.category, input.content, input.metadata)) {
           case (?errMsg) {
-            errors := Array.append(errors, ["Skipped " # input.key # ": " # errMsg]);
+            errors := Array.concat(errors, ["Skipped " # input.key # ": " # errMsg]);
             skipped += 1;
           };
           case null {
-            let existing = Trie.get(memories, textKey(input.key), Text.equal);
+            let existing = Map.get(memories, Text.compare, input.key);
             let shouldStore = switch (existing) {
               case (?e) { input.updatedAt > e.updatedAt };
               case null { true };
             };
             if (shouldStore) {
-              let isNew = switch (existing) {
-                case null { true };
-                case _ { false };
-              };
               let newEntry : Types.MemoryEntry = {
                 key = input.key;
                 category = input.category;
@@ -416,40 +399,38 @@ persistent actor class UserVault(initOwner : Principal) {
                 createdAt = input.createdAt;
                 updatedAt = input.updatedAt;
               };
-              let (newMem, old) = Trie.put(memories, textKey(input.key), Text.equal, newEntry);
-              memories := newMem;
 
-              if (isNew) {
-                memoriesCount += 1;
-                incrementCategory(input.category);
-                bytesUsed += memoryEntrySize(newEntry);
-              } else {
-                switch (old) {
-                  case (?oldEntry) {
-                    if (oldEntry.category != input.category) {
-                      // Category changed: decrement old, increment new.
-                      // If old category still has entries, recompute its max
-                      // since the moved entry may have been the max.
-                      let oldCatCount = switch (Trie.get(categoryCounts, textKey(oldEntry.category), Text.equal)) {
-                        case (?n) { n };
-                        case null { 0 };
-                      };
-                      decrementCategory(oldEntry.category);
-                      if (oldCatCount > 1) {
-                        recomputeCategoryMaxUpdated(oldEntry.category);
-                      };
-                      incrementCategory(input.category);
+              let old = Map.take(memories, Text.compare, input.key);
+              Map.add(memories, Text.compare, input.key, newEntry);
+
+              switch (old) {
+                case null {
+                  incrementCategory(input.category);
+                  bytesUsed += memoryEntrySize(newEntry);
+                };
+                case (?oldEntry) {
+                  if (oldEntry.category != input.category) {
+                    // Category changed: decrement old, increment new.
+                    // If old category still has entries, recompute its max
+                    // since the moved entry may have been the max.
+                    let oldCatCount = switch (Map.get(categoryCounts, Text.compare, oldEntry.category)) {
+                      case (?n) { n };
+                      case null { 0 };
                     };
-                    let oldSize = memoryEntrySize(oldEntry);
-                    let newSize = memoryEntrySize(newEntry);
-                    if (newSize >= oldSize) {
-                      bytesUsed += (newSize - oldSize);
-                    } else {
-                      let diff = oldSize - newSize;
-                      bytesUsed := if (bytesUsed >= diff) { bytesUsed - diff } else { 0 };
+                    decrementCategory(oldEntry.category);
+                    if (oldCatCount > 1) {
+                      recomputeCategoryMaxUpdated(oldEntry.category);
                     };
+                    incrementCategory(input.category);
                   };
-                  case null {};
+                  let oldSize = memoryEntrySize(oldEntry);
+                  let newSize = memoryEntrySize(newEntry);
+                  if (newSize >= oldSize) {
+                    bytesUsed += (newSize - oldSize);
+                  } else {
+                    let diff = oldSize - newSize;
+                    bytesUsed := if (bytesUsed >= diff) { bytesUsed - diff } else { 0 };
+                  };
                 };
               };
               updateCategoryMaxUpdated(input.category, input.updatedAt);
@@ -463,53 +444,47 @@ persistent actor class UserVault(initOwner : Principal) {
     };
 
     // Sync sessions
-    for (input in sessionInputs.vals()) {
+    for (input in sessionInputs.values()) {
       if (input.sessionId == "") {
-        errors := Array.append(errors, ["Skipped session with empty sessionId"]);
+        errors := Array.concat(errors, ["Skipped session with empty sessionId"]);
         skipped += 1;
       } else {
         // Validate session input sizes
         switch (validateSessionInput(input.sessionId, input.data)) {
           case (?errMsg) {
-            errors := Array.append(errors, ["Skipped session " # input.sessionId # ": " # errMsg]);
+            errors := Array.concat(errors, ["Skipped session " # input.sessionId # ": " # errMsg]);
             skipped += 1;
           };
           case null {
-            let existing = Trie.get(sessions, textKey(input.sessionId), Text.equal);
+            let existing = Map.get(sessions, Text.compare, input.sessionId);
             let shouldStore = switch (existing) {
               case (?e) { input.startedAt > e.startedAt };
               case null { true };
             };
             if (shouldStore) {
-              let isNew = switch (existing) {
-                case null { true };
-                case _ { false };
-              };
               let newSession : Types.SessionEntry = {
                 sessionId = input.sessionId;
                 data = input.data;
                 startedAt = input.startedAt;
                 endedAt = input.endedAt;
               };
-              let (newSess, old) = Trie.put(sessions, textKey(input.sessionId), Text.equal, newSession);
-              sessions := newSess;
 
-              if (isNew) {
-                sessionsCount += 1;
-                bytesUsed += sessionEntrySize(newSession);
-              } else {
-                switch (old) {
-                  case (?oldSession) {
-                    let oldSize = sessionEntrySize(oldSession);
-                    let newSize = sessionEntrySize(newSession);
-                    if (newSize >= oldSize) {
-                      bytesUsed += (newSize - oldSize);
-                    } else {
-                      let diff = oldSize - newSize;
-                      bytesUsed := if (bytesUsed >= diff) { bytesUsed - diff } else { 0 };
-                    };
+              let old = Map.take(sessions, Text.compare, input.sessionId);
+              Map.add(sessions, Text.compare, input.sessionId, newSession);
+
+              switch (old) {
+                case null {
+                  bytesUsed += sessionEntrySize(newSession);
+                };
+                case (?oldSession) {
+                  let oldSize = sessionEntrySize(oldSession);
+                  let newSize = sessionEntrySize(newSession);
+                  if (newSize >= oldSize) {
+                    bytesUsed += (newSize - oldSize);
+                  } else {
+                    let diff = oldSize - newSize;
+                    bytesUsed := if (bytesUsed >= diff) { bytesUsed - diff } else { 0 };
                   };
-                  case null {};
                 };
               };
               stored += 1;
@@ -564,7 +539,7 @@ persistent actor class UserVault(initOwner : Principal) {
       case null {};
     };
 
-    let existing = Trie.get(sessions, textKey(sessionId), Text.equal);
+    let existing = Map.get(sessions, Text.compare, sessionId);
 
     // Only overwrite if newer (prevent stale session overwrites).
     // Uses AND logic: skip only if BOTH endedAt and startedAt are older-or-equal.
@@ -579,11 +554,6 @@ persistent actor class UserVault(initOwner : Principal) {
       case null {};
     };
 
-    let isNew = switch (existing) {
-      case null { true };
-      case _ { false };
-    };
-
     let newSession : Types.SessionEntry = {
       sessionId = sessionId;
       data = data;
@@ -591,25 +561,22 @@ persistent actor class UserVault(initOwner : Principal) {
       endedAt = endedAt;
     };
 
-    let (newSess, old) = Trie.put(sessions, textKey(sessionId), Text.equal, newSession);
-    sessions := newSess;
+    let old = Map.take(sessions, Text.compare, sessionId);
+    Map.add(sessions, Text.compare, sessionId, newSession);
 
-    if (isNew) {
-      sessionsCount += 1;
-      bytesUsed += sessionEntrySize(newSession);
-    } else {
-      switch (old) {
-        case (?oldSession) {
-          let oldSize = sessionEntrySize(oldSession);
-          let newSize = sessionEntrySize(newSession);
-          if (newSize >= oldSize) {
-            bytesUsed += (newSize - oldSize);
-          } else {
-            let diff = oldSize - newSize;
-            bytesUsed := if (bytesUsed >= diff) { bytesUsed - diff } else { 0 };
-          };
+    switch (old) {
+      case null {
+        bytesUsed += sessionEntrySize(newSession);
+      };
+      case (?oldSession) {
+        let oldSize = sessionEntrySize(oldSession);
+        let newSize = sessionEntrySize(newSession);
+        if (newSize >= oldSize) {
+          bytesUsed += (newSize - oldSize);
+        } else {
+          let diff = oldSize - newSize;
+          bytesUsed := if (bytesUsed >= diff) { bytesUsed - diff } else { 0 };
         };
-        case null {};
       };
     };
 
@@ -634,7 +601,7 @@ persistent actor class UserVault(initOwner : Principal) {
   /// Recall a specific memory by key.
   public query ({ caller }) func recall(key : Text) : async Result.Result<?Types.MemoryEntry, Types.VaultError> {
     if (caller != owner) { return #err(#unauthorized) };
-    #ok(Trie.get(memories, textKey(key), Text.equal));
+    #ok(Map.get(memories, Text.compare, key));
   };
 
   /// Get vault statistics.
@@ -652,16 +619,16 @@ persistent actor class UserVault(initOwner : Principal) {
   /// Get paginated audit log entries (chronological order).
   public query ({ caller }) func getAuditLog(offset : Nat, limit : Nat) : async Result.Result<[Types.AuditEntry], Types.VaultError> {
     if (caller != owner) { return #err(#unauthorized) };
-    let size = auditLog.size();
+    let size = List.size(auditLog);
     if (offset >= size) { return #ok([]) };
     let end = if (offset + limit > size) { size } else { offset + limit };
-    #ok(Array.tabulate<Types.AuditEntry>(end - offset, func(i) { auditLog[offset + i] }));
+    #ok(Array.tabulate<Types.AuditEntry>(end - offset, func(i) { List.at(auditLog, offset + i) }));
   };
 
   /// Get total audit log size.
   public query ({ caller }) func getAuditLogSize() : async Result.Result<Nat, Types.VaultError> {
     if (caller != owner) { return #err(#unauthorized) };
-    #ok(auditLog.size());
+    #ok(List.size(auditLog));
   };
 
   /// Get vault owner principal (owner-only to prevent privacy leak).
@@ -691,9 +658,9 @@ persistent actor class UserVault(initOwner : Principal) {
   ) : async Result.Result<[Types.MemoryEntry], Types.VaultError> {
     if (caller != owner) { return #err(#unauthorized) };
 
-    // Collect all matches first
-    var matches : [Types.MemoryEntry] = [];
-    for ((_, entry) in Trie.iter(memories)) {
+    // Collect all matches into a list
+    let matches = List.empty<Types.MemoryEntry>();
+    for ((_, entry) in Map.entries(memories)) {
       let catMatch = switch (category) {
         case (?c) { entry.category == c };
         case null { true };
@@ -703,20 +670,21 @@ persistent actor class UserVault(initOwner : Principal) {
         case null { true };
       };
       if (catMatch and prefixMatch) {
-        matches := Array.append(matches, [entry]);
+        List.add(matches, entry);
       };
     };
 
     // Sort by updatedAt descending (most recent first)
-    let sorted = Array.sort<Types.MemoryEntry>(matches, func(a, b) {
+    let sorted = List.sort<Types.MemoryEntry>(matches, func(a, b) {
       if (a.updatedAt > b.updatedAt) { #less }
       else if (a.updatedAt < b.updatedAt) { #greater }
       else { #equal };
     });
 
     // Take up to limit
-    let resultSize = if (sorted.size() < limit) { sorted.size() } else { limit };
-    #ok(Array.tabulate<Types.MemoryEntry>(resultSize, func(i) { sorted[i] }));
+    let sortedSize = List.size(sorted);
+    let resultSize = if (sortedSize < limit) { sortedSize } else { limit };
+    #ok(Array.tabulate<Types.MemoryEntry>(resultSize, func(i) { List.at(sorted, i) }));
   };
 
   /// Get paginated sessions (most recent first).
@@ -726,10 +694,7 @@ persistent actor class UserVault(initOwner : Principal) {
   ) : async Result.Result<[Types.SessionEntry], Types.VaultError> {
     if (caller != owner) { return #err(#unauthorized) };
 
-    let all = Trie.toArray<Text, Types.SessionEntry, Types.SessionEntry>(
-      sessions,
-      func(_, v) { v },
-    );
+    let all = Array.fromIter<Types.SessionEntry>(Map.values(sessions));
     let sorted = Array.sort<Types.SessionEntry>(all, func(a, b) {
       if (a.startedAt > b.startedAt) { #less }
       else if (a.startedAt < b.startedAt) { #greater }
@@ -750,8 +715,8 @@ persistent actor class UserVault(initOwner : Principal) {
     });
     #ok({
       lastUpdated = lastUpdated;
-      memoriesCount = memoriesCount;
-      sessionsCount = sessionsCount;
+      memoriesCount = Map.size(memories);
+      sessionsCount = Map.size(sessions);
       categoryChecksums = checksums;
     });
   };

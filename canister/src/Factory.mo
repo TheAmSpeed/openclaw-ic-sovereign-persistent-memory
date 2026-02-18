@@ -1,17 +1,16 @@
 import Types "Types";
-import Array "mo:base/Array";
-import Nat "mo:base/Nat";
-import Principal "mo:base/Principal";
-import Result "mo:base/Result";
-import Trie "mo:base/Trie";
-import ExperimentalCycles "mo:base/ExperimentalCycles";
-import Time "mo:base/Time";
+import List "mo:core/List";
+import Map "mo:core/Map";
+import Principal "mo:core/Principal";
+import Result "mo:core/Result";
+import Cycles "mo:core/Cycles";
+import Time "mo:core/Time";
 
 import UserVault "UserVault";
 
 /// Factory canister that spawns per-user UserVault canisters.
 /// Launcher, not landlord -- creates vault, then transfers control to the user.
-/// Uses Trie for O(1) vault lookups (replaces O(n) linear scan over arrays).
+/// Uses Map (B-tree, order 32) for O(log n) vault lookups.
 persistent actor Factory {
 
   // -- IC management canister interface (subset for controller transfer) --
@@ -41,23 +40,20 @@ persistent actor Factory {
 
   // -- State (auto-persisted via EOP) --
 
-  // Trie of owner principal -> vault canister ID for O(1) lookup and O(1) amortized insert
-  // (replaces O(n) linear scan and O(n) Array.append)
-  var vaultsTrie : Trie.Trie<Principal, Principal> = Trie.empty();
+  // Map of owner principal -> vault canister ID for O(log n) lookup and insert.
+  // Map is mutable (B-tree): add/remove mutate in-place, no reassignment needed.
+  var vaults : Map.Map<Principal, Principal> = Map.empty<Principal, Principal>();
   var totalCreated : Nat = 0;
 
-  // Audit log for factory operations (array for EOP compatibility)
-  var auditLog : [Types.AuditEntry] = [];
+  // Audit log for factory operations.
+  // List provides amortized O(1) append and O(1) random access, and is a stable type.
+  var auditLog : List.List<Types.AuditEntry> = List.empty<Types.AuditEntry>();
 
   // -- Internal helpers --
 
-  func principalKey(p : Principal) : Trie.Key<Principal> {
-    { key = p; hash = Principal.hash(p) };
-  };
-
-  /// Look up a vault for a principal. O(1) via Trie.
+  /// Look up a vault for a principal. O(log n) via Map.
   func findVault(owner : Principal) : ?Principal {
-    Trie.get(vaultsTrie, principalKey(owner), Principal.equal);
+    Map.get(vaults, Principal.compare, owner);
   };
 
   /// Assert caller is admin. Returns error result if not.
@@ -73,7 +69,7 @@ persistent actor Factory {
 
   /// Append to factory audit log.
   func appendAudit(entry : Types.AuditEntry) {
-    auditLog := Array.append(auditLog, [entry]);
+    List.add(auditLog, entry);
   };
 
   // -- Public API --
@@ -86,24 +82,23 @@ persistent actor Factory {
       return #err(#creationFailed("Anonymous callers cannot create vaults"));
     };
 
-    // Check if vault already exists -- O(1) lookup
+    // Check if vault already exists -- O(log n) lookup
     switch (findVault(caller)) {
       case (?_) { return #err(#alreadyExists) };
       case null {};
     };
 
     // Check we have enough cycles to seed the new vault
-    if (ExperimentalCycles.balance() < VAULT_CREATION_CYCLES + 1_000_000_000) {
+    if (Cycles.balance() < VAULT_CREATION_CYCLES + 1_000_000_000) {
       return #err(#insufficientCycles);
     };
 
     // Seed cycles and create the UserVault canister
-    ExperimentalCycles.add<system>(VAULT_CREATION_CYCLES);
-    let vault = await UserVault.UserVault(caller);
+    let vault = await (with cycles = VAULT_CREATION_CYCLES) UserVault.UserVault(caller);
     let canisterId = Principal.fromActor(vault);
 
-    // Store the mapping -- O(1) amortized via Trie (replaces O(n) Array.append)
-    vaultsTrie := Trie.put(vaultsTrie, principalKey(caller), Principal.equal, canisterId).0;
+    // Store the mapping -- Map mutates in-place, no reassignment needed
+    Map.add(vaults, Principal.compare, caller, canisterId);
     totalCreated += 1;
 
     // Transfer IC-level controller to the user (+ keep Factory for future ops)
@@ -232,7 +227,7 @@ persistent actor Factory {
       case null {};
     };
 
-    vaultsTrie := Trie.put(vaultsTrie, principalKey(owner), Principal.equal, vaultId).0;
+    Map.add(vaults, Principal.compare, owner, vaultId);
     totalCreated += 1;
     #ok(());
   };
@@ -263,6 +258,6 @@ persistent actor Factory {
         if (caller != a) { return #err(#unauthorized("Only admin can view all vaults")) };
       };
     };
-    #ok(Trie.toArray<Principal, Principal, (Principal, Principal)>(vaultsTrie, func(k, v) { (k, v) }));
+    #ok(Map.toArray(vaults));
   };
 };
