@@ -6,6 +6,7 @@ import { rmSync } from "fs";
 import { parseConfig, type IcStorageConfig } from "./config.js";
 import type { SyncManifestData } from "./ic-client.js";
 import { encodeContent, decodeContent, computeSyncDelta, type LocalMemory } from "./sync.js";
+import { formatBytes, formatCycles } from "./index.js";
 
 // ============================================================
 // Config parsing tests
@@ -348,10 +349,69 @@ describe("plugin metadata", () => {
 // ============================================================
 
 describe("utility functions", () => {
-  it("formatBytes handles various sizes", async () => {
-    // The formatBytes function is module-private, so we test via the plugin
-    const mod = await import("./index.js");
-    expect(mod.default).toBeDefined();
+  describe("formatBytes", () => {
+    it("returns '0 B' for zero", () => {
+      expect(formatBytes(0)).toBe("0 B");
+    });
+
+    it("returns '0 B' for negative numbers", () => {
+      expect(formatBytes(-100)).toBe("0 B");
+    });
+
+    it("returns '0 B' for NaN", () => {
+      expect(formatBytes(NaN)).toBe("0 B");
+    });
+
+    it("returns '0 B' for Infinity", () => {
+      expect(formatBytes(Infinity)).toBe("0 B");
+    });
+
+    it("formats bytes", () => {
+      expect(formatBytes(512)).toBe("512.0 B");
+    });
+
+    it("formats kilobytes", () => {
+      expect(formatBytes(1024)).toBe("1.0 KB");
+      expect(formatBytes(1536)).toBe("1.5 KB");
+    });
+
+    it("formats megabytes", () => {
+      expect(formatBytes(1024 * 1024)).toBe("1.0 MB");
+      expect(formatBytes(2.5 * 1024 * 1024)).toBe("2.5 MB");
+    });
+
+    it("formats gigabytes", () => {
+      expect(formatBytes(1024 ** 3)).toBe("1.0 GB");
+    });
+
+    it("formats terabytes", () => {
+      expect(formatBytes(1024 ** 4)).toBe("1.0 TB");
+    });
+
+    it("clamps to TB for very large values", () => {
+      // 1024^5 (PB) should still show as TB since TB is the last unit
+      expect(formatBytes(1024 ** 5)).toBe("1024.0 TB");
+    });
+  });
+
+  describe("formatCycles", () => {
+    it("formats small values with locale string", () => {
+      const result = formatCycles(999_999_999);
+      // toLocaleString output varies by locale, just check it's a string
+      expect(typeof result).toBe("string");
+      expect(result).not.toContain("T");
+      expect(result).not.toContain("B");
+    });
+
+    it("formats billions", () => {
+      expect(formatCycles(1_000_000_000)).toBe("1.00 B");
+      expect(formatCycles(5_500_000_000)).toBe("5.50 B");
+    });
+
+    it("formats trillions", () => {
+      expect(formatCycles(1_000_000_000_000)).toBe("1.00 T");
+      expect(formatCycles(2_750_000_000_000)).toBe("2.75 T");
+    });
   });
 });
 

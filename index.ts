@@ -639,9 +639,9 @@ const icStoragePlugin = {
   },
 };
 
-// -- Utility functions --
+// -- Utility functions (exported for testing) --
 
-function formatBytes(bytes: number): string {
+export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
@@ -649,7 +649,7 @@ function formatBytes(bytes: number): string {
   return `${val.toFixed(1)} ${units[i]}`;
 }
 
-function formatCycles(cycles: number): string {
+export function formatCycles(cycles: number): string {
   if (cycles >= 1_000_000_000_000) {
     return `${(cycles / 1_000_000_000_000).toFixed(2)} T`;
   }

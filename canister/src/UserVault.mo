@@ -52,6 +52,9 @@ persistent actor class UserVault(initOwner : Principal) {
   // Category counts -- maintained incrementally instead of O(n) recompute
   var categoryCounts : Trie.Trie<Text, Nat> = Trie.empty();
 
+  // Category max updatedAt -- maintained incrementally for O(1) categoryChecksum
+  var categoryMaxUpdated : Trie.Trie<Text, Int> = Trie.empty();
+
   // -- Trie key helpers --
 
   func textKey(t : Text) : Trie.Key<Text> {
@@ -85,11 +88,39 @@ persistent actor class UserVault(initOwner : Principal) {
       case (?n) {
         if (n <= 1) {
           categoryCounts := Trie.remove(categoryCounts, textKey(category), Text.equal).0;
+          categoryMaxUpdated := Trie.remove(categoryMaxUpdated, textKey(category), Text.equal).0;
         } else {
           categoryCounts := Trie.put(categoryCounts, textKey(category), Text.equal, n - 1).0;
         };
       };
       case null {}; // shouldn't happen, but defensive
+    };
+  };
+
+  /// Update the max updatedAt for a category if the given timestamp is newer.
+  func updateCategoryMaxUpdated(category : Text, updatedAt : Int) {
+    let current = switch (Trie.get(categoryMaxUpdated, textKey(category), Text.equal)) {
+      case (?ts) { ts };
+      case null { 0 };
+    };
+    if (updatedAt > current) {
+      categoryMaxUpdated := Trie.put(categoryMaxUpdated, textKey(category), Text.equal, updatedAt).0;
+    };
+  };
+
+  /// Recompute max updatedAt for a category by scanning its entries.
+  /// Only needed on delete when the deleted entry might have been the max.
+  func recomputeCategoryMaxUpdated(category : Text) {
+    var maxUpdated : Int = 0;
+    for ((_, entry) in Trie.iter(memories)) {
+      if (entry.category == category and entry.updatedAt > maxUpdated) {
+        maxUpdated := entry.updatedAt;
+      };
+    };
+    if (maxUpdated > 0) {
+      categoryMaxUpdated := Trie.put(categoryMaxUpdated, textKey(category), Text.equal, maxUpdated).0;
+    } else {
+      categoryMaxUpdated := Trie.remove(categoryMaxUpdated, textKey(category), Text.equal).0;
     };
   };
 
@@ -194,17 +225,15 @@ persistent actor class UserVault(initOwner : Principal) {
   };
 
   /// Simple checksum for a category's entries: count:maxUpdatedAt.
-  /// Lightweight alternative to hashing all entries.
+  /// O(1) using incrementally maintained categoryCounts and categoryMaxUpdated Tries.
   func categoryChecksum(category : Text) : Text {
-    var count : Nat = 0;
-    var maxUpdated : Int = 0;
-    for ((_, entry) in Trie.iter(memories)) {
-      if (entry.category == category) {
-        count += 1;
-        if (entry.updatedAt > maxUpdated) {
-          maxUpdated := entry.updatedAt;
-        };
-      };
+    let count = switch (Trie.get(categoryCounts, textKey(category), Text.equal)) {
+      case (?n) { n };
+      case null { 0 };
+    };
+    let maxUpdated = switch (Trie.get(categoryMaxUpdated, textKey(category), Text.equal)) {
+      case (?ts) { ts };
+      case null { 0 };
     };
     Nat.toText(count) # ":" # Int.toText(maxUpdated);
   };
@@ -250,7 +279,7 @@ persistent actor class UserVault(initOwner : Principal) {
     let (newMemories, old) = Trie.put(memories, textKey(key), Text.equal, newEntry);
     memories := newMemories;
 
-    // Update counts and bytesUsed
+    // Update counts, bytesUsed, and categoryMaxUpdated
     switch (old) {
       case null {
         memoriesCount += 1;
@@ -274,6 +303,7 @@ persistent actor class UserVault(initOwner : Principal) {
         };
       };
     };
+    updateCategoryMaxUpdated(category, now);
 
     lastUpdated := now;
 
@@ -304,7 +334,17 @@ persistent actor class UserVault(initOwner : Principal) {
         // Defensive underflow protection
         if (memoriesCount > 0) { memoriesCount -= 1 };
 
+        // decrementCategory removes categoryMaxUpdated if count reaches 0;
+        // otherwise recompute since deleted entry may have been the max.
+        let catCount = switch (Trie.get(categoryCounts, textKey(removed.category), Text.equal)) {
+          case (?n) { n };
+          case null { 0 };
+        };
         decrementCategory(removed.category);
+        if (catCount > 1) {
+          // Category still has entries — recompute max since we may have removed the max entry
+          recomputeCategoryMaxUpdated(removed.category);
+        };
 
         // Adjust bytesUsed
         let removedSize = memoryEntrySize(removed);
@@ -397,6 +437,7 @@ persistent actor class UserVault(initOwner : Principal) {
                   case null {};
                 };
               };
+              updateCategoryMaxUpdated(input.category, input.updatedAt);
               stored += 1;
             } else {
               skipped += 1;
