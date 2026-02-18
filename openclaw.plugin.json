@@ -1,0 +1,72 @@
+{
+  "id": "ic-sovereign-persistent-memory",
+  "name": "IC Sovereign Persistent Memory",
+  "description": "Sovereign, persistent AI memory on the Internet Computer. Your memories live in a personal canister that only you control.",
+  "kind": "memory",
+  "version": "1.0.0",
+  "skills": ["skills/ic-storage"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "canisterId": {
+        "type": "string",
+        "description": "Your personal vault canister ID (set automatically during setup)"
+      },
+      "factoryCanisterId": {
+        "type": "string",
+        "description": "Factory canister ID for vault creation"
+      },
+      "network": {
+        "type": "string",
+        "enum": ["local", "ic"],
+        "default": "ic"
+      },
+      "autoSync": {
+        "type": "boolean",
+        "default": true,
+        "description": "Auto-sync memories to your IC vault"
+      },
+      "syncOnSessionEnd": {
+        "type": "boolean",
+        "default": true,
+        "description": "Sync session data when a session ends"
+      },
+      "syncOnAgentEnd": {
+        "type": "boolean",
+        "default": true,
+        "description": "Sync new memories when a conversation ends"
+      }
+    }
+  },
+  "uiHints": {
+    "canisterId": {
+      "label": "Vault Canister ID",
+      "placeholder": "Created automatically during setup",
+      "help": "Your personal vault canister ID on the Internet Computer. Set automatically when you run the setup command."
+    },
+    "factoryCanisterId": {
+      "label": "Factory Canister ID",
+      "placeholder": "v7tpn-laaaa-aaaac-bcmdq-cai",
+      "help": "Factory canister that creates user vaults. Pre-configured for IC mainnet.",
+      "advanced": true
+    },
+    "network": {
+      "label": "Network",
+      "help": "Use 'ic' for Internet Computer mainnet (default), 'local' for development with dfx.",
+      "advanced": true
+    },
+    "autoSync": {
+      "label": "Auto Sync",
+      "help": "Automatically sync memories and sessions to your IC vault in the background."
+    },
+    "syncOnSessionEnd": {
+      "label": "Sync on Session End",
+      "help": "Push session data to your IC vault when a session ends."
+    },
+    "syncOnAgentEnd": {
+      "label": "Sync on Agent End",
+      "help": "Push new memories to your IC vault when a conversation ends."
+    }
+  }
+}

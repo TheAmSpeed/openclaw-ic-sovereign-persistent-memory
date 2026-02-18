@@ -1,0 +1,22 @@
+{
+  "canisters": {
+    "factory": {
+      "type": "motoko",
+      "main": "src/Factory.mo"
+    },
+    "user_vault": {
+      "type": "motoko",
+      "main": "src/UserVault.mo"
+    },
+    "user_vault_test": {
+      "type": "motoko",
+      "main": "test/UserVaultTest.mo"
+    }
+  },
+  "defaults": {
+    "build": {
+      "packtool": ""
+    }
+  },
+  "version": 1
+}

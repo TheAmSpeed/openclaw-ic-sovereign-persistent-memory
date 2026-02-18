@@ -1,0 +1,73 @@
+{
+  "name": "openclaw-ic-sovereign-persistent-memory",
+  "version": "1.0.0",
+  "description": "Sovereign, persistent AI memory on the Internet Computer. Your memories live in a personal canister that only you control -- across devices, forever.",
+  "type": "module",
+  "main": "./index.ts",
+  "files": [
+    "index.ts",
+    "config.ts",
+    "ic-client.ts",
+    "prompts.ts",
+    "sync.ts",
+    "openclaw.plugin.json",
+    "skills/"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint"
+  },
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "internet-computer",
+    "ic",
+    "icp",
+    "dfinity",
+    "memory",
+    "ai-memory",
+    "sovereign",
+    "persistent",
+    "decentralized",
+    "web3",
+    "canister",
+    "motoko",
+    "cross-device",
+    "backup",
+    "vault"
+  ],
+  "author": "TheAmSpeed",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TheAmSpeed/openclaw-ic-sovereign-persistent-memory.git"
+  },
+  "bugs": {
+    "url": "https://github.com/TheAmSpeed/openclaw-ic-sovereign-persistent-memory/issues"
+  },
+  "homepage": "https://github.com/TheAmSpeed/openclaw-ic-sovereign-persistent-memory#readme",
+  "dependencies": {
+    "@dfinity/agent": "^2.3.0",
+    "@dfinity/auth-client": "^2.3.0",
+    "@dfinity/candid": "^2.3.0",
+    "@dfinity/identity": "^2.3.0",
+    "@dfinity/principal": "^2.3.0",
+    "@sinclair/typebox": "^0.34.0"
+  },
+  "devDependencies": {
+    "openclaw": "^2026.2.15",
+    "vitest": "^3.0.0",
+    "typescript": "^5.7.0",
+    "oxlint": "^0.16.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.1.26"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
