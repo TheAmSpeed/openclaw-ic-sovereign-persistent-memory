@@ -8,6 +8,7 @@
 
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
+import { homedir } from "os";
 
 // -- Prompt state persistence --
 
@@ -34,7 +35,7 @@ const DEFAULT_STATE: PromptState = {
 
 /// Get the path to the prompt state file.
 export function getStatePath(configDir?: string): string {
-  const base = configDir ?? join(process.env.HOME ?? "~", ".openclaw");
+  const base = configDir ?? join(homedir(), ".openclaw");
   return join(base, "ic-sovereign-memory-state.json");
 }
 

@@ -71,14 +71,15 @@ const icStoragePlugin = {
         }),
         async execute(_toolCallId, params) {
           try {
+            const nowMs = Date.now(); // milliseconds (Number-safe; converted to ns at canister boundary)
             const localMemories: LocalMemory[] = (params.memories ?? []).map(
               (m: { key: string; category: string; content: string; metadata?: string }) => ({
                 key: m.key,
                 category: m.category,
                 content: m.content,
                 metadata: m.metadata ?? "{}",
-                createdAt: Date.now() * 1_000_000, // nanoseconds
-                updatedAt: Date.now() * 1_000_000,
+                createdAt: nowMs,
+                updatedAt: nowMs,
               }),
             );
 
@@ -387,7 +388,7 @@ const icStoragePlugin = {
         if (!cfg.canisterId) return;
         // Phase 2: wire to MemorySearchManager to pull session memories and sync.
         // No-op for now -- sync must be triggered manually via vault_sync tool or CLI.
-        api.logger.info?.("IC Memory Vault: session_end hook fired (sync wiring pending Phase 2)");
+        api.logger.info("IC Sovereign Memory: session_end hook fired (sync wiring pending Phase 2)");
       });
     }
 
@@ -421,7 +422,7 @@ const icStoragePlugin = {
       // Phase 2: wire to MemorySearchManager to pull conversation memories and sync.
       // No-op for now -- sync must be triggered manually via vault_sync tool or CLI.
       if (cfg.canisterId && cfg.syncOnAgentEnd) {
-        api.logger.info?.("IC Memory Vault: agent_end hook fired (sync wiring pending Phase 2)");
+        api.logger.info("IC Sovereign Memory: agent_end hook fired (sync wiring pending Phase 2)");
       }
     });
 
@@ -586,10 +587,17 @@ const icStoragePlugin = {
           .action(async (opts) => {
             try {
               const ic = getClient();
-              const entries = await ic.getAuditLog(
-                parseInt(opts.offset, 10),
-                parseInt(opts.limit, 10),
-              );
+              const offset = parseInt(opts.offset, 10);
+              const limit = parseInt(opts.limit, 10);
+              if (isNaN(offset) || offset < 0) {
+                console.error("  Invalid offset. Must be a non-negative number.");
+                return;
+              }
+              if (isNaN(limit) || limit < 1) {
+                console.error("  Invalid limit. Must be a positive number.");
+                return;
+              }
+              const entries = await ic.getAuditLog(offset, limit);
               const total = await ic.getAuditLogSize();
 
               console.log("");
@@ -634,9 +642,9 @@ const icStoragePlugin = {
 // -- Utility functions --
 
 function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   const val = bytes / Math.pow(1024, i);
   return `${val.toFixed(1)} ${units[i]}`;
 }

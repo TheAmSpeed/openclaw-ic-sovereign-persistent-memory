@@ -1,4 +1,4 @@
-/// @dfinity/agent wrapper for IC Memory Vault.
+/// @dfinity/agent wrapper for IC Sovereign Persistent Memory.
 /// Handles authentication (II 2.0), agent creation, and canister calls.
 
 import { Actor, HttpAgent } from "@dfinity/agent";
@@ -110,28 +110,51 @@ const ResultOkPrincipal = IDL.Variant({
   err: FactoryError,
 });
 
+// Result types for queries (queries now return Results instead of trapping)
+const ResultOkOptMemory = IDL.Variant({ ok: IDL.Opt(MemoryEntry), err: VaultError });
+const ResultOkStats = IDL.Variant({ ok: VaultStats, err: VaultError });
+const ResultOkCategories = IDL.Variant({ ok: IDL.Vec(IDL.Text), err: VaultError });
+const ResultOkAuditEntries = IDL.Variant({ ok: IDL.Vec(AuditEntry), err: VaultError });
+const ResultOkNat = IDL.Variant({ ok: IDL.Nat, err: VaultError });
+const ResultOkPrincipalVault = IDL.Variant({ ok: IDL.Principal, err: VaultError });
+const ResultOkDashboard = IDL.Variant({ ok: DashboardData, err: VaultError });
+const ResultOkMemories = IDL.Variant({ ok: IDL.Vec(MemoryEntry), err: VaultError });
+const ResultOkSessions = IDL.Variant({ ok: IDL.Vec(SessionEntry), err: VaultError });
+const ResultOkManifest = IDL.Variant({ ok: SyncManifest, err: VaultError });
+
+// Factory Result types
+const ResultOkFactoryVaults = IDL.Variant({
+  ok: IDL.Vec(IDL.Tuple(IDL.Principal, IDL.Principal)),
+  err: FactoryError,
+});
+const ResultOkFactoryUnit = IDL.Variant({ ok: IDL.Null, err: FactoryError });
+
 // -- IDL factories --
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- InterfaceFactory param type from @dfinity/candid
 const userVaultIdlFactory = ({ IDL: _IDL }: any) => {
   return IDL.Service({
+    // Update calls
     store: IDL.Func([IDL.Text, IDL.Text, IDL.Vec(IDL.Nat8), IDL.Text], [ResultOkUnit], []),
     delete: IDL.Func([IDL.Text], [ResultOkUnit], []),
     bulkSync: IDL.Func([IDL.Vec(MemoryInput), IDL.Vec(SessionInput)], [ResultOkSyncResult], []),
     storeSession: IDL.Func([IDL.Text, IDL.Vec(IDL.Nat8), IDL.Int, IDL.Int], [ResultOkUnit], []),
-    recall: IDL.Func([IDL.Text], [IDL.Opt(MemoryEntry)], ["query"]),
-    getStats: IDL.Func([], [VaultStats], ["query"]),
-    getCategories: IDL.Func([], [IDL.Vec(IDL.Text)], ["query"]),
-    getAuditLog: IDL.Func([IDL.Nat, IDL.Nat], [IDL.Vec(AuditEntry)], ["query"]),
-    getAuditLogSize: IDL.Func([], [IDL.Nat], ["query"]),
-    getOwner: IDL.Func([], [IDL.Principal], ["query"]),
-    getDashboard: IDL.Func([], [DashboardData], ["composite_query"]),
+    // Query calls (now return Result types)
+    recall: IDL.Func([IDL.Text], [ResultOkOptMemory], ["query"]),
+    getStats: IDL.Func([], [ResultOkStats], ["query"]),
+    getCategories: IDL.Func([], [ResultOkCategories], ["query"]),
+    getAuditLog: IDL.Func([IDL.Nat, IDL.Nat], [ResultOkAuditEntries], ["query"]),
+    getAuditLogSize: IDL.Func([], [ResultOkNat], ["query"]),
+    getOwner: IDL.Func([], [ResultOkPrincipalVault], ["query"]),
+    // Composite queries (now return Result types)
+    getDashboard: IDL.Func([], [ResultOkDashboard], ["composite_query"]),
     recallRelevant: IDL.Func(
       [IDL.Opt(IDL.Text), IDL.Opt(IDL.Text), IDL.Nat],
-      [IDL.Vec(MemoryEntry)],
+      [ResultOkMemories],
       ["composite_query"],
     ),
-    getSyncManifest: IDL.Func([], [SyncManifest], ["composite_query"]),
+    getSessions: IDL.Func([IDL.Nat, IDL.Nat], [ResultOkSessions], ["composite_query"]),
+    getSyncManifest: IDL.Func([], [ResultOkManifest], ["composite_query"]),
   });
 };
 
@@ -139,9 +162,14 @@ const userVaultIdlFactory = ({ IDL: _IDL }: any) => {
 const factoryIdlFactory = ({ IDL: _IDL }: any) => {
   return IDL.Service({
     createVault: IDL.Func([], [ResultOkPrincipal], []),
+    transferController: IDL.Func([], [ResultOkFactoryUnit], []),
+    revokeFactoryController: IDL.Func([], [ResultOkFactoryUnit], []),
+    claimAdmin: IDL.Func([], [ResultOkFactoryUnit], []),
+    adminRegisterVault: IDL.Func([IDL.Principal, IDL.Principal], [ResultOkFactoryUnit], []),
+    getAdmin: IDL.Func([], [IDL.Opt(IDL.Principal)], ["query"]),
     getVault: IDL.Func([], [IDL.Opt(IDL.Principal)], ["query"]),
     getTotalCreated: IDL.Func([], [IDL.Nat], ["query"]),
-    getAllVaults: IDL.Func([], [IDL.Vec(IDL.Tuple(IDL.Principal, IDL.Principal))], ["query"]),
+    getAllVaults: IDL.Func([], [ResultOkFactoryVaults], ["query"]),
   });
 };
 
@@ -206,12 +234,34 @@ export interface AuditEntryData {
   details: [] | [string];
 }
 
+// -- Helpers --
+
+/// Unwrap a Candid Result variant. Throws on #err.
+function unwrapResult<T>(result: { ok: T } | { err: unknown }, context: string): T {
+  if ("ok" in result) {
+    return result.ok;
+  }
+  const err = (result as { err: unknown }).err;
+  if (err && typeof err === "object") {
+    if ("unauthorized" in err) throw new Error(`${context}: Unauthorized -- you are not the vault owner`);
+    if ("notFound" in err) throw new Error(`${context}: Not found`);
+    if ("invalidInput" in err) throw new Error(`${context}: Invalid input -- ${(err as { invalidInput: string }).invalidInput}`);
+    if ("alreadyExists" in err) throw new Error(`${context}: Already exists`);
+    if ("insufficientCycles" in err) throw new Error(`${context}: Insufficient cycles`);
+    if ("creationFailed" in err) throw new Error(`${context}: Creation failed -- ${(err as { creationFailed: string }).creationFailed}`);
+  }
+  throw new Error(`${context}: Unknown error`);
+}
+
 // -- IC Client --
 
 export class IcClient {
   private agent: HttpAgent | null = null;
   private authClient: AuthClient | null = null;
   private config: IcStorageConfig;
+  private authenticated = false;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- cached actor; methods accessed dynamically
+  private cachedVaultActor: any = null;
 
   constructor(config: IcStorageConfig) {
     this.config = config;
@@ -235,6 +285,9 @@ export class IcClient {
       await this.agent.fetchRootKey();
     }
 
+    // Mark as NOT authenticated -- this is an unauthenticated agent
+    this.authenticated = false;
+
     return this.agent;
   }
 
@@ -245,7 +298,7 @@ export class IcClient {
     const isAuthenticated = await this.authClient.isAuthenticated();
     if (!isAuthenticated) {
       throw new Error(
-        "Not authenticated. Please run /vault-setup to authenticate with Internet Identity.",
+        "Not authenticated. Please run `openclaw ic-memory setup` to authenticate with Internet Identity.",
       );
     }
 
@@ -258,6 +311,9 @@ export class IcClient {
     if (this.config.network === "local") {
       await this.agent.fetchRootKey();
     }
+
+    this.authenticated = true;
+    this.cachedVaultActor = null; // invalidate cached actor on new agent
 
     return this.agent;
   }
@@ -285,6 +341,9 @@ export class IcClient {
           if (this.config.network === "local") {
             await this.agent.fetchRootKey();
           }
+
+          this.authenticated = true;
+          this.cachedVaultActor = null; // invalidate on new auth
 
           resolve(principal);
         },
@@ -349,6 +408,30 @@ export class IcClient {
     return result.length > 0 ? (result[0] ?? null) : null;
   }
 
+  /// Revoke Factory's controller access to the caller's vault.
+  /// Makes the vault fully sovereign -- only the owner is a controller.
+  async revokeFactoryController(): Promise<{ ok: null } | { err: string }> {
+    const agent = await this.getAuthenticatedAgent();
+    if (!this.config.factoryCanisterId) {
+      return { err: "Factory canister ID not configured" };
+    }
+
+    const factory = Actor.createActor(factoryIdlFactory, {
+      agent,
+      canisterId: this.config.factoryCanisterId,
+    });
+
+    const result = (await factory.revokeFactoryController()) as
+      | { ok: null }
+      | { err: { unauthorized: string } | { notFound: string } };
+
+    if ("ok" in result) return { ok: null };
+    const errVal = result.err;
+    if ("unauthorized" in errVal) return { err: errVal.unauthorized };
+    if ("notFound" in errVal) return { err: errVal.notFound };
+    return { err: "Unknown error" };
+  }
+
   // -- Vault methods --
 
   /// Store a memory entry.
@@ -367,11 +450,14 @@ export class IcClient {
     return { err: this.formatVaultError(result.err) };
   }
 
-  /// Recall a specific memory.
+  /// Recall a specific memory. Now unwraps Result from query.
   async recall(key: string): Promise<MemoryEntryData | null> {
     const actor = await this.getVaultActor();
-    const result = (await actor.recall(key)) as [] | [MemoryEntryData];
-    return result.length > 0 ? (result[0] ?? null) : null;
+    const result = (await actor.recall(key)) as
+      | { ok: [] | [MemoryEntryData] }
+      | { err: unknown };
+    const opt = unwrapResult(result, "recall");
+    return opt.length > 0 ? (opt[0] ?? null) : null;
   }
 
   /// Delete a memory.
@@ -427,74 +513,97 @@ export class IcClient {
     return { err: this.formatVaultError(result.err) };
   }
 
-  /// Get vault stats.
+  /// Get vault stats. Unwraps Result from query.
   async getStats(): Promise<VaultStatsData> {
     const actor = await this.getVaultActor();
-    return (await actor.getStats()) as VaultStatsData;
+    const result = (await actor.getStats()) as { ok: VaultStatsData } | { err: unknown };
+    return unwrapResult(result, "getStats");
   }
 
-  /// Get dashboard data (composite query).
+  /// Get dashboard data (composite query). Unwraps Result.
   async getDashboard(): Promise<DashboardDataResult> {
     const actor = await this.getVaultActor();
-    return (await actor.getDashboard()) as DashboardDataResult;
+    const result = (await actor.getDashboard()) as { ok: DashboardDataResult } | { err: unknown };
+    return unwrapResult(result, "getDashboard");
   }
 
-  /// Get sync manifest (composite query).
+  /// Get sync manifest (composite query). Unwraps Result.
   async getSyncManifest(): Promise<SyncManifestData> {
     const actor = await this.getVaultActor();
-    return (await actor.getSyncManifest()) as SyncManifestData;
+    const result = (await actor.getSyncManifest()) as { ok: SyncManifestData } | { err: unknown };
+    return unwrapResult(result, "getSyncManifest");
   }
 
-  /// Search memories by category/prefix (composite query).
+  /// Search memories by category/prefix (composite query). Unwraps Result.
   async recallRelevant(
     category: string | null,
     prefix: string | null,
     limit: number,
   ): Promise<MemoryEntryData[]> {
     const actor = await this.getVaultActor();
-    return (await actor.recallRelevant(
+    const result = (await actor.recallRelevant(
       category ? [category] : [],
       prefix ? [prefix] : [],
       BigInt(limit),
-    )) as MemoryEntryData[];
+    )) as { ok: MemoryEntryData[] } | { err: unknown };
+    return unwrapResult(result, "recallRelevant");
   }
 
-  /// Get audit log (paginated).
+  /// Get paginated sessions (composite query). Unwraps Result.
+  async getSessions(offset: number, limit: number): Promise<SessionEntryData[]> {
+    const actor = await this.getVaultActor();
+    const result = (await actor.getSessions(BigInt(offset), BigInt(limit))) as
+      | { ok: SessionEntryData[] }
+      | { err: unknown };
+    return unwrapResult(result, "getSessions");
+  }
+
+  /// Get audit log (paginated). Unwraps Result.
   async getAuditLog(offset: number, limit: number): Promise<AuditEntryData[]> {
     const actor = await this.getVaultActor();
-    return (await actor.getAuditLog(BigInt(offset), BigInt(limit))) as AuditEntryData[];
+    const result = (await actor.getAuditLog(BigInt(offset), BigInt(limit))) as
+      | { ok: AuditEntryData[] }
+      | { err: unknown };
+    return unwrapResult(result, "getAuditLog");
   }
 
-  /// Get audit log size.
+  /// Get audit log size. Unwraps Result.
   async getAuditLogSize(): Promise<bigint> {
     const actor = await this.getVaultActor();
-    return (await actor.getAuditLogSize()) as bigint;
+    const result = (await actor.getAuditLogSize()) as { ok: bigint } | { err: unknown };
+    return unwrapResult(result, "getAuditLogSize");
   }
 
-  /// Get categories.
+  /// Get categories. Unwraps Result.
   async getCategories(): Promise<string[]> {
     const actor = await this.getVaultActor();
-    return (await actor.getCategories()) as string[];
+    const result = (await actor.getCategories()) as { ok: string[] } | { err: unknown };
+    return unwrapResult(result, "getCategories");
   }
 
   // -- Internal helpers --
 
   private async getAuthenticatedAgent(): Promise<HttpAgent> {
-    if (this.agent) return this.agent;
+    // Only return cached agent if it was created with authentication
+    if (this.agent && this.authenticated) return this.agent;
     return this.initAuthenticatedAgent();
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Actor.createActor returns untyped actor; methods accessed dynamically
   private async getVaultActor(): Promise<any> {
     if (!this.config.canisterId) {
-      throw new Error("Vault canister ID not configured. Run /vault-setup first.");
+      throw new Error("Vault canister ID not configured. Run `openclaw ic-memory setup` first.");
     }
 
+    // Return cached actor if agent hasn't changed
+    if (this.cachedVaultActor) return this.cachedVaultActor;
+
     const agent = await this.getAuthenticatedAgent();
-    return Actor.createActor(userVaultIdlFactory, {
+    this.cachedVaultActor = Actor.createActor(userVaultIdlFactory, {
       agent,
       canisterId: this.config.canisterId,
     });
+    return this.cachedVaultActor;
   }
 
   private formatVaultError(

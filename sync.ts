@@ -1,30 +1,32 @@
-/// Differential sync logic for IC Memory Vault.
+/// Differential sync logic for IC Sovereign Persistent Memory.
 /// Compares local state with IC vault and syncs only what's changed.
 
-import type { IcClient, SyncManifestData, SyncResultData } from "./ic-client.js";
+import type { IcClient, SyncManifestData } from "./ic-client.js";
 
 export interface LocalMemory {
   key: string;
   category: string;
   content: string; // will be encoded to Uint8Array
   metadata: string;
-  createdAt: number;
-  updatedAt: number;
+  createdAt: number; // milliseconds (safe for Number; converted to nanoseconds at canister boundary)
+  updatedAt: number; // milliseconds
 }
 
 export interface LocalSession {
   sessionId: string;
   data: string; // will be encoded to Uint8Array
-  startedAt: number;
-  endedAt: number;
+  startedAt: number; // milliseconds
+  endedAt: number;   // milliseconds
 }
 
-export interface SyncStatus {
-  lastSyncAt: number;
-  memoriesSynced: number;
-  sessionsSynced: number;
-  isConnected: boolean;
-  error?: string;
+/// Convert milliseconds to IC nanoseconds (BigInt).
+function msToNs(ms: number): bigint {
+  return BigInt(ms) * 1_000_000n;
+}
+
+/// Convert IC nanoseconds (BigInt) to milliseconds (Number-safe).
+function nsToMs(ns: bigint): number {
+  return Number(ns / 1_000_000n);
 }
 
 const textEncoder = new TextEncoder();
@@ -79,8 +81,8 @@ export function computeSyncDelta(
     }
 
     // If local entry is newer than vault's lastUpdated, sync it
-    // The vault's bulkSync will handle per-key conflict resolution
-    if (BigInt(mem.updatedAt) > manifest.lastUpdated) {
+    // Convert local ms to ns for comparison with vault's nanosecond timestamps
+    if (msToNs(mem.updatedAt) > manifest.lastUpdated) {
       toSync.push(mem);
     } else {
       toSkip.push(mem);
@@ -92,6 +94,14 @@ export function computeSyncDelta(
 
 /// Batch size for bulk sync calls (avoid exceeding message size limits).
 const BATCH_SIZE = 100;
+
+/// Error class for authentication failures (should not be swallowed).
+class IcAuthError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "IcAuthError";
+  }
+}
 
 /// Perform a full sync of local memories and sessions to the IC vault.
 export async function performSync(
@@ -113,7 +123,12 @@ export async function performSync(
   try {
     manifest = await client.getSyncManifest();
   } catch (err) {
-    // If vault is empty or unreachable, sync everything
+    const msg = err instanceof Error ? err.message : String(err);
+    // Auth errors and network errors should propagate -- don't silently swallow them
+    if (msg.includes("Unauthorized") || msg.includes("Not authenticated")) {
+      throw new IcAuthError(msg);
+    }
+    // Only treat "empty vault" type errors as a fresh start
     manifest = {
       lastUpdated: 0n,
       memoriesCount: 0n,
@@ -141,8 +156,8 @@ export async function performSync(
       category: m.category,
       content: encodeContent(m.content),
       metadata: m.metadata,
-      createdAt: BigInt(m.createdAt),
-      updatedAt: BigInt(m.updatedAt),
+      createdAt: msToNs(m.createdAt),
+      updatedAt: msToNs(m.updatedAt),
     }));
 
     // Only include sessions in the first batch
@@ -151,8 +166,8 @@ export async function performSync(
         ? localSessions.map((s) => ({
             sessionId: s.sessionId,
             data: encodeContent(s.data),
-            startedAt: BigInt(s.startedAt),
-            endedAt: BigInt(s.endedAt),
+            startedAt: msToNs(s.startedAt),
+            endedAt: msToNs(s.endedAt),
           }))
         : [];
 
@@ -175,8 +190,8 @@ export async function performSync(
     const sessionInputs = localSessions.map((s) => ({
       sessionId: s.sessionId,
       data: encodeContent(s.data),
-      startedAt: BigInt(s.startedAt),
-      endedAt: BigInt(s.endedAt),
+      startedAt: msToNs(s.startedAt),
+      endedAt: msToNs(s.endedAt),
     }));
 
     const result = await client.bulkSync([], sessionInputs);
@@ -196,7 +211,8 @@ export async function performSync(
   return { totalStored, totalSkipped, errors: allErrors };
 }
 
-/// Restore all memories from the IC vault.
+/// Restore all memories and sessions from the IC vault.
+/// Uses paginated getSessions to restore ALL sessions (not just dashboard's recent 5).
 export async function restoreFromVault(
   client: IcClient,
   onProgress?: (msg: string) => void,
@@ -223,20 +239,33 @@ export async function restoreFromVault(
         category: entry.category,
         content: decodeContent(entry.content),
         metadata: entry.metadata,
-        createdAt: Number(entry.createdAt),
-        updatedAt: Number(entry.updatedAt),
+        createdAt: nsToMs(entry.createdAt),
+        updatedAt: nsToMs(entry.updatedAt),
       });
     }
     onProgress?.(`Fetched ${allMemories.length} memories (${cat})`);
   }
 
-  // Sessions: for now we return what's in the dashboard
-  const allSessions: LocalSession[] = dashboard.recentSessions.map((s) => ({
-    sessionId: s.sessionId,
-    data: decodeContent(s.data),
-    startedAt: Number(s.startedAt),
-    endedAt: Number(s.endedAt),
-  }));
+  // Fetch ALL sessions via paginated getSessions (replaces dashboard's limited 5)
+  const allSessions: LocalSession[] = [];
+  const SESSION_PAGE_SIZE = 100;
+  let sessionOffset = 0;
+
+  while (true) {
+    const batch = await client.getSessions(sessionOffset, SESSION_PAGE_SIZE);
+    for (const s of batch) {
+      allSessions.push({
+        sessionId: s.sessionId,
+        data: decodeContent(s.data),
+        startedAt: nsToMs(s.startedAt),
+        endedAt: nsToMs(s.endedAt),
+      });
+    }
+    onProgress?.(`Fetched ${allSessions.length} sessions`);
+
+    if (batch.length < SESSION_PAGE_SIZE) break; // last page
+    sessionOffset += SESSION_PAGE_SIZE;
+  }
 
   onProgress?.(`Restore complete: ${allMemories.length} memories, ${allSessions.length} sessions`);
 

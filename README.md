@@ -118,7 +118,7 @@ Environment variables are supported: `canisterId: "${MY_CANISTER_ID}"` resolves 
 
 | Item | Cost |
 |---|---|
-| Vault creation | ~$0.65 (one-time, from pre-funded pool) |
+| Vault creation | ~$1.56 (one-time, 1.2T cycles from pre-funded pool) |
 | Storage | ~$0.54/year for typical usage (100 MB) |
 | Query calls (reads) | Free |
 | Update calls (writes) | Minimal cycle cost per operation |
@@ -166,9 +166,9 @@ canister/             Motoko canister source (Factory + UserVault)
 
 ## Known Limitations
 
-- `restoreFromVault` session restore is capped at 5 sessions (from `getDashboard`). A dedicated `getAllSessions` query will be added in a future release.
-- `Array.append` in Motoko canisters is O(n) per call for audit log entries. Will migrate to `Buffer` for O(1) amortized in a future canister upgrade.
 - Auto-sync hooks (`session_end`, `agent_end`) are wired but pending Phase 2 integration with OpenClaw's `MemorySearchManager` to pull actual local memories. Manual sync via `vault_sync` tool or `openclaw ic-memory sync` works now.
+- The `vault_delete` agent tool is intentionally omitted. Deletion is available via the canister API for advanced users, but the agent encourages an append-friendly workflow.
+- Audit log entries are capped at 100,000 with FIFO eviction of the oldest 10% when full.
 
 ## License
 

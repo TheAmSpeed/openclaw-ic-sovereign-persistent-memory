@@ -1,15 +1,19 @@
 import Types "Types";
 import Array "mo:base/Array";
+import Buffer "mo:base/Buffer";
 import Nat "mo:base/Nat";
 import Principal "mo:base/Principal";
 import Result "mo:base/Result";
+import Trie "mo:base/Trie";
+import Text "mo:base/Text";
 import ExperimentalCycles "mo:base/ExperimentalCycles";
+import Time "mo:base/Time";
 
 import UserVault "UserVault";
 
 /// Factory canister that spawns per-user UserVault canisters.
 /// Launcher, not landlord -- creates vault, then transfers control to the user.
-/// Uses stable arrays (not Buffer) for EOP compatibility.
+/// Uses Trie for O(1) vault lookups (replaces O(n) linear scan over arrays).
 persistent actor Factory {
 
   // -- IC management canister interface (subset for controller transfer) --
@@ -33,22 +37,29 @@ persistent actor Factory {
   let VAULT_CREATION_CYCLES : Nat = 1_200_000_000_000;
 
   // Admin principal (deployer) -- set once via claimAdmin, then immutable.
+  // IMPORTANT: With EOP (persistent actor), this survives upgrades.
+  // Never use --wasm-memory-persistence replace on the Factory canister.
   var admin : ?Principal = null;
 
   // -- State (auto-persisted via EOP) --
 
-  // Array of (owner principal, vault canister ID) pairs
-  var vaults : [(Principal, Principal)] = [];
+  // Trie of owner principal -> vault canister ID for O(1) lookup and O(1) amortized insert
+  // (replaces O(n) linear scan and O(n) Array.append)
+  var vaultsTrie : Trie.Trie<Principal, Principal> = Trie.empty();
   var totalCreated : Nat = 0;
+
+  // Audit log for factory operations (Buffer for O(1) amortized appends)
+  var auditLogBuf : Buffer.Buffer<Types.AuditEntry> = Buffer.Buffer<Types.AuditEntry>(16);
 
   // -- Internal helpers --
 
-  /// Look up a vault for a principal.
+  func principalKey(p : Principal) : Trie.Key<Principal> {
+    { key = p; hash = Principal.hash(p) };
+  };
+
+  /// Look up a vault for a principal. O(1) via Trie.
   func findVault(owner : Principal) : ?Principal {
-    for ((p, canisterId) in vaults.vals()) {
-      if (p == owner) { return ?canisterId };
-    };
-    null;
+    Trie.get(vaultsTrie, principalKey(owner), Principal.equal);
   };
 
   /// Assert caller is admin. Returns error result if not.
@@ -62,6 +73,11 @@ persistent actor Factory {
     };
   };
 
+  /// Append to factory audit log.
+  func appendAudit(entry : Types.AuditEntry) {
+    auditLogBuf.add(entry);
+  };
+
   // -- Public API --
 
   /// Create a new vault for the caller.
@@ -72,7 +88,7 @@ persistent actor Factory {
       return #err(#creationFailed("Anonymous callers cannot create vaults"));
     };
 
-    // Check if vault already exists
+    // Check if vault already exists -- O(1) lookup
     switch (findVault(caller)) {
       case (?_) { return #err(#alreadyExists) };
       case null {};
@@ -88,9 +104,8 @@ persistent actor Factory {
     let vault = await UserVault.UserVault(caller);
     let canisterId = Principal.fromActor(vault);
 
-    // Store the mapping first so a trap in update_settings doesn't orphan
-    // the vault. The owner can retry controller transfer via transferController.
-    vaults := Array.append(vaults, [(caller, canisterId)]);
+    // Store the mapping -- O(1) amortized via Trie (replaces O(n) Array.append)
+    vaultsTrie := Trie.put(vaultsTrie, principalKey(caller), Principal.equal, canisterId).0;
     totalCreated += 1;
 
     // Transfer IC-level controller to the user (+ keep Factory for future ops)
@@ -103,6 +118,15 @@ persistent actor Factory {
         memory_allocation = null;
         freezing_threshold = null;
       };
+    });
+
+    appendAudit({
+      timestamp = Time.now();
+      action = #created;
+      caller = caller;
+      key = ?Principal.toText(canisterId);
+      category = ?"factory";
+      details = ?"Vault created";
     });
 
     #ok(canisterId);
@@ -135,12 +159,51 @@ persistent actor Factory {
     };
   };
 
+  /// Revoke Factory's controller access to the caller's vault.
+  /// After this call, only the vault owner is a controller.
+  /// This makes the vault fully sovereign -- the Factory can no longer
+  /// upgrade or modify the vault canister settings.
+  /// WARNING: This is irreversible. The Factory cannot re-add itself.
+  public shared ({ caller }) func revokeFactoryController() : async Result.Result<(), Types.FactoryError> {
+    if (Principal.isAnonymous(caller)) {
+      return #err(#unauthorized("Anonymous callers cannot revoke controllers"));
+    };
+
+    switch (findVault(caller)) {
+      case null { return #err(#notFound("No vault found for caller")) };
+      case (?vaultId) {
+        // Set controllers to [owner] only -- removes Factory
+        await ic.update_settings({
+          canister_id = vaultId;
+          settings = {
+            controllers = ?[caller];
+            compute_allocation = null;
+            memory_allocation = null;
+            freezing_threshold = null;
+          };
+        });
+
+        appendAudit({
+          timestamp = Time.now();
+          action = #created; // Reuse #created for factory-level operations; details field disambiguates
+          caller = caller;
+          key = ?Principal.toText(vaultId);
+          category = ?"factory";
+          details = ?"Factory controller revoked -- vault is fully sovereign";
+        });
+
+        #ok(());
+      };
+    };
+  };
+
   // -- Admin functions --
 
   /// Claim admin role. Can only be called once (when admin is unset).
-  /// IMPORTANT: Call immediately after deployment/upgrade to secure the Factory.
-  /// After an upgrade with --wasm-memory-persistence replace, admin resets to
-  /// null and must be re-claimed.
+  /// IMPORTANT: Call immediately after deployment to secure the Factory.
+  /// With EOP (persistent actor), admin survives canister upgrades.
+  /// NEVER use --wasm-memory-persistence replace on the Factory canister,
+  /// as that resets all state including admin, creating a frontrunning window.
   public shared ({ caller }) func claimAdmin() : async Result.Result<(), Types.FactoryError> {
     if (Principal.isAnonymous(caller)) {
       return #err(#unauthorized("Anonymous callers cannot claim admin"));
@@ -171,7 +234,7 @@ persistent actor Factory {
       case null {};
     };
 
-    vaults := Array.append(vaults, [(owner, vaultId)]);
+    vaultsTrie := Trie.put(vaultsTrie, principalKey(owner), Principal.equal, vaultId).0;
     totalCreated += 1;
     #ok(());
   };
@@ -194,11 +257,14 @@ persistent actor Factory {
   };
 
   /// Get all vaults (admin-only diagnostic).
-  public query ({ caller }) func getAllVaults() : async [(Principal, Principal)] {
+  /// Returns Result instead of assert-trapping on unauthorized access.
+  public query ({ caller }) func getAllVaults() : async Result.Result<[(Principal, Principal)], Types.FactoryError> {
     switch (admin) {
-      case (?a) { assert (caller == a) };
-      case null { assert false }; // no admin set -- deny all
+      case null { return #err(#unauthorized("Admin not set")) };
+      case (?a) {
+        if (caller != a) { return #err(#unauthorized("Only admin can view all vaults")) };
+      };
     };
-    vaults;
+    #ok(Trie.toArray<Principal, Principal, (Principal, Principal)>(vaultsTrie, func(k, v) { (k, v) }));
   };
 };

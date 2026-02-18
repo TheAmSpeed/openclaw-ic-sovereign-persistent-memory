@@ -55,6 +55,8 @@ The following tools are available to the AI agent:
 - **vault_status** -- Show vault stats: memory count, session count, cycle balance, categories
 - **vault_audit** -- Show the immutable audit log with consensus-verified timestamps
 
+Note: Deletion is available via the canister API for advanced users but is intentionally not exposed as an agent tool to encourage an append-friendly workflow.
+
 ## How It Works
 
 1. Your local AI memories (SQLite/LanceDB) remain the primary store for instant reads/writes.
@@ -96,7 +98,7 @@ Config lives under `plugins.entries.ic-sovereign-persistent-memory.config`:
 
 ## Cost
 
-- Vault creation: ~$0.65 (one-time, from pre-funded pool)
+- Vault creation: ~$1.56 (one-time, 1.2T cycles from pre-funded pool)
 - Storage: ~$0.54/year for typical usage (100 MB)
 - All query calls (reads): free
 - Update calls (writes): minimal cycle cost per operation

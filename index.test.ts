@@ -1,7 +1,8 @@
 /// Tests for IC Sovereign Persistent Memory plugin.
 /// Covers: config parsing, sync logic, encoding utilities, and plugin structure.
 
-import { describe, it, expect, vi, beforeAll } from "vitest";
+import { describe, it, expect, beforeAll } from "vitest";
+import { rmSync } from "fs";
 import { parseConfig, type IcStorageConfig } from "./config.js";
 import type { SyncManifestData } from "./ic-client.js";
 import { encodeContent, decodeContent, computeSyncDelta, type LocalMemory } from "./sync.js";
@@ -89,11 +90,21 @@ describe("config", () => {
       delete process.env.TEST_FACTORY_ID;
     });
 
-    it("replaces undefined env vars with empty string", () => {
+    it("replaces undefined env vars with undefined canisterId", () => {
       const cfg = parseConfig({
         canisterId: "${NONEXISTENT_VAR}",
       });
-      expect(cfg.canisterId).toBe("");
+      // Empty string from unresolved env var is treated as undefined (no canister configured)
+      expect(cfg.canisterId).toBeUndefined();
+    });
+
+    it("rejects invalid canisterId format", () => {
+      expect(() => parseConfig({ canisterId: "INVALID!" })).toThrow("Invalid canisterId format");
+    });
+
+    it("accepts valid canisterId format", () => {
+      const cfg = parseConfig({ canisterId: "uxrrr-q7777-77774-qaaaq-cai" });
+      expect(cfg.canisterId).toBe("uxrrr-q7777-77774-qaaaq-cai");
     });
   });
 });
@@ -117,7 +128,7 @@ describe("encoding", () => {
   });
 
   it("handles unicode content", () => {
-    const original = "Unicode test: \\u4f60\\u597d \\ud83d\\ude80 \\u00e9\\u00e8\\u00ea";
+    const original = "Unicode test: \u4f60\u597d \ud83d\ude80 \u00e9\u00e8\u00ea";
     const encoded = encodeContent(original);
     const decoded = decodeContent(encoded);
     expect(decoded).toBe(original);
@@ -153,14 +164,19 @@ describe("encoding", () => {
 // ============================================================
 
 describe("computeSyncDelta", () => {
-  const makeMemory = (key: string, category: string, updatedAt: number): LocalMemory => ({
+  // Local timestamps are in milliseconds; manifest lastUpdated is in nanoseconds (IC convention).
+  // msToNs(ms) = ms * 1_000_000n is used internally by computeSyncDelta for comparison.
+  const makeMemory = (key: string, category: string, updatedAtMs: number): LocalMemory => ({
     key,
     category,
     content: `content of ${key}`,
     metadata: "{}",
-    createdAt: updatedAt - 1000,
-    updatedAt,
+    createdAt: updatedAtMs - 1000,
+    updatedAt: updatedAtMs,
   });
+
+  // Helper: convert ms to ns BigInt (matching canister convention)
+  const msToNsBigInt = (ms: number) => BigInt(ms) * 1_000_000n;
 
   it("syncs everything when vault is empty", () => {
     const local = [makeMemory("key1", "facts", 1000), makeMemory("key2", "prefs", 2000)];
@@ -178,11 +194,11 @@ describe("computeSyncDelta", () => {
 
   it("syncs entries newer than vault lastUpdated", () => {
     const local = [
-      makeMemory("key1", "facts", 5000), // newer than vault
-      makeMemory("key2", "facts", 1000), // older than vault
+      makeMemory("key1", "facts", 5000), // newer than vault (5000ms > 3000ms)
+      makeMemory("key2", "facts", 1000), // older than vault (1000ms < 3000ms)
     ];
     const manifest: SyncManifestData = {
-      lastUpdated: 3000n,
+      lastUpdated: msToNsBigInt(3000), // 3000ms in nanoseconds
       memoriesCount: 1n,
       sessionsCount: 0n,
       categoryChecksums: [["facts", "some-checksum"]],
@@ -198,7 +214,7 @@ describe("computeSyncDelta", () => {
   it("syncs entries in new categories", () => {
     const local = [makeMemory("key1", "facts", 1000), makeMemory("key2", "new-category", 1000)];
     const manifest: SyncManifestData = {
-      lastUpdated: 5000n,
+      lastUpdated: msToNsBigInt(5000), // 5000ms in nanoseconds
       memoriesCount: 1n,
       sessionsCount: 0n,
       categoryChecksums: [["facts", "checksum"]],
@@ -214,7 +230,7 @@ describe("computeSyncDelta", () => {
 
   it("handles empty local memories", () => {
     const manifest: SyncManifestData = {
-      lastUpdated: 5000n,
+      lastUpdated: msToNsBigInt(5000),
       memoriesCount: 10n,
       sessionsCount: 2n,
       categoryChecksums: [["facts", "checksum"]],
@@ -227,12 +243,12 @@ describe("computeSyncDelta", () => {
 
   it("handles vault with multiple categories", () => {
     const local = [
-      makeMemory("key1", "facts", 6000),
-      makeMemory("key2", "prefs", 6000),
-      makeMemory("key3", "ideas", 1000),
+      makeMemory("key1", "facts", 6000),   // newer than vault (6000ms > 5000ms)
+      makeMemory("key2", "prefs", 6000),   // newer than vault
+      makeMemory("key3", "ideas", 1000),   // older than vault (1000ms < 5000ms)
     ];
     const manifest: SyncManifestData = {
-      lastUpdated: 5000n,
+      lastUpdated: msToNsBigInt(5000),
       memoriesCount: 5n,
       sessionsCount: 0n,
       categoryChecksums: [
@@ -556,6 +572,9 @@ describe("smart prompting", () => {
       expect(loaded.promptCount).toBe(3);
       expect(loaded.trackedMemoryCount).toBe(75);
       expect(loaded.vaultConfigured).toBe(false);
+
+      // Cleanup temp directory
+      try { rmSync(tmpDir, { recursive: true }); } catch {}
     });
   });
 });

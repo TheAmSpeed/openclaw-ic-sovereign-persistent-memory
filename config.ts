@@ -64,6 +64,12 @@ export function parseConfig(value: unknown): IcStorageConfig {
       throw new Error("canisterId must be a string");
     }
     canisterId = resolveEnvVars(raw.canisterId);
+    // Reject empty strings (e.g. from unresolved env vars) and validate format
+    if (canisterId === "") {
+      canisterId = undefined;
+    } else if (canisterId && !/^[a-z0-9-]+$/.test(canisterId)) {
+      throw new Error(`Invalid canisterId format "${canisterId}". Expected IC canister ID (e.g. "uxrrr-q7777-77774-qaaaq-cai").`);
+    }
   }
 
   let factoryCanisterId = DEFAULT_FACTORY_CANISTER_ID;
@@ -72,6 +78,9 @@ export function parseConfig(value: unknown): IcStorageConfig {
       throw new Error("factoryCanisterId must be a string");
     }
     factoryCanisterId = resolveEnvVars(raw.factoryCanisterId);
+    if (factoryCanisterId && !/^[a-z0-9-]+$/.test(factoryCanisterId)) {
+      throw new Error(`Invalid factoryCanisterId format "${factoryCanisterId}". Expected IC canister ID.`);
+    }
   }
 
   return {
