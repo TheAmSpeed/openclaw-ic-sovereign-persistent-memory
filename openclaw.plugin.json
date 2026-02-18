@@ -3,7 +3,7 @@
   "name": "IC Sovereign Persistent Memory",
   "description": "Sovereign, persistent AI memory on the Internet Computer. Your memories live in a personal canister that only you control.",
   "kind": "memory",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "skills": ["skills/ic-storage"],
   "configSchema": {
     "type": "object",
