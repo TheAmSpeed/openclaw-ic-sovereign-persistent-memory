@@ -289,7 +289,15 @@ persistent actor class UserVault(initOwner : Principal) {
       case (?oldEntry) {
         // Category may have changed
         if (oldEntry.category != category) {
+          // Decrement old category and recompute its max if entries remain
+          let oldCatCount = switch (Trie.get(categoryCounts, textKey(oldEntry.category), Text.equal)) {
+            case (?n) { n };
+            case null { 0 };
+          };
           decrementCategory(oldEntry.category);
+          if (oldCatCount > 1) {
+            recomputeCategoryMaxUpdated(oldEntry.category);
+          };
           incrementCategory(category);
         };
         // Adjust bytesUsed: remove old, add new
@@ -422,7 +430,17 @@ persistent actor class UserVault(initOwner : Principal) {
                 switch (old) {
                   case (?oldEntry) {
                     if (oldEntry.category != input.category) {
+                      // Category changed: decrement old, increment new.
+                      // If old category still has entries, recompute its max
+                      // since the moved entry may have been the max.
+                      let oldCatCount = switch (Trie.get(categoryCounts, textKey(oldEntry.category), Text.equal)) {
+                        case (?n) { n };
+                        case null { 0 };
+                      };
                       decrementCategory(oldEntry.category);
+                      if (oldCatCount > 1) {
+                        recomputeCategoryMaxUpdated(oldEntry.category);
+                      };
                       incrementCategory(input.category);
                     };
                     let oldSize = memoryEntrySize(oldEntry);

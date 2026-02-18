@@ -293,7 +293,25 @@ export class IcClient {
 
   /// Initialize authenticated agent via Internet Identity.
   async initAuthenticatedAgent(): Promise<HttpAgent> {
-    this.authClient = await AuthClient.create();
+    // Guard: AuthClient uses IndexedDB which is only available in browser environments
+    if (typeof globalThis.indexedDB === "undefined") {
+      throw new Error(
+        "Authentication requires browser APIs (IndexedDB) not available in this environment. " +
+        "Configure your canister ID manually -- see `openclaw ic-memory setup` for instructions.",
+      );
+    }
+    try {
+      this.authClient = await AuthClient.create();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("indexedDB") || msg.includes("window") || msg.includes("document")) {
+        throw new Error(
+          "Authentication requires browser APIs (IndexedDB) not available in this environment. " +
+          "Configure your canister ID manually -- see `openclaw ic-memory setup` for instructions.",
+        );
+      }
+      throw err;
+    }
 
     const isAuthenticated = await this.authClient.isAuthenticated();
     if (!isAuthenticated) {
@@ -321,7 +339,25 @@ export class IcClient {
   /// Authenticate with Internet Identity 2.0.
   /// Returns the principal after successful auth.
   async authenticate(): Promise<Principal> {
-    this.authClient = await AuthClient.create();
+    // Guard: AuthClient uses IndexedDB which is only available in browser environments
+    if (typeof globalThis.indexedDB === "undefined") {
+      throw new Error(
+        "Internet Identity authentication requires browser APIs (IndexedDB) not available in this CLI environment. " +
+        "See the setup instructions for manual canister ID configuration.",
+      );
+    }
+    try {
+      this.authClient = await AuthClient.create();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("indexedDB") || msg.includes("window") || msg.includes("document")) {
+        throw new Error(
+          "Internet Identity authentication requires browser APIs (IndexedDB) not available in this CLI environment. " +
+          "See the setup instructions for manual canister ID configuration.",
+        );
+      }
+      throw err;
+    }
 
     return new Promise((resolve, reject) => {
       this.authClient!.login({
@@ -356,10 +392,16 @@ export class IcClient {
 
   /// Check if user is currently authenticated.
   async isAuthenticated(): Promise<boolean> {
-    if (!this.authClient) {
-      this.authClient = await AuthClient.create();
+    if (typeof globalThis.indexedDB === "undefined") return false;
+    try {
+      if (!this.authClient) {
+        this.authClient = await AuthClient.create();
+      }
+      return this.authClient.isAuthenticated();
+    } catch {
+      // AuthClient.create() fails in non-browser environments (no IndexedDB)
+      return false;
     }
-    return this.authClient.isAuthenticated();
   }
 
   // -- Factory methods --

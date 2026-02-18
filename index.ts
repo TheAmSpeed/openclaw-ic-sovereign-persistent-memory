@@ -18,7 +18,7 @@ import {
 import { performSync, restoreFromVault, decodeContent, type LocalMemory } from "./sync.js";
 
 const icStoragePlugin = {
-  id: "ic-sovereign-persistent-memory",
+      id: "openclaw-ic-sovereign-persistent-memory",
   name: "IC Sovereign Persistent Memory",
   description:
     "Sovereign, persistent AI memory on the Internet Computer. " +
@@ -250,7 +250,7 @@ const icStoragePlugin = {
               `  Categories: ${s.categories.join(", ") || "(none)"}`,
               `  Storage:   ${formatBytes(Number(s.bytesUsed))}`,
               `  Cycles:    ${formatCycles(Number(s.cycleBalance))}`,
-              `  Last sync: ${s.lastUpdated === 0n ? "never" : new Date(Number(s.lastUpdated) / 1_000_000).toISOString()}`,
+              `  Last sync: ${s.lastUpdated === 0n ? "never" : new Date(Number(s.lastUpdated / 1_000_000n)).toISOString()}`,
             ].join("\n");
 
             return {
@@ -312,7 +312,7 @@ const icStoragePlugin = {
               const key = e.key.length > 0 ? e.key[0] : "-";
               const cat = e.category.length > 0 ? e.category[0] : "-";
               const details = e.details.length > 0 ? e.details[0] : "";
-              const ts = new Date(Number(e.timestamp) / 1_000_000).toISOString();
+                const ts = new Date(Number(e.timestamp / 1_000_000n)).toISOString();
               return `${ts} [${action}] key=${key} cat=${cat} ${details}`.trim();
             });
 
@@ -462,7 +462,7 @@ const icStoragePlugin = {
                 console.log(`  You already have a vault: ${existingVault.toText()}`);
                 console.log("");
                 console.log("  To connect this device, add to your OpenClaw config:");
-                console.log(`    plugins.entries.ic-sovereign-persistent-memory.config.canisterId = "${existingVault.toText()}"`);
+                console.log(`    plugins.entries.openclaw-ic-sovereign-persistent-memory.config.canisterId = "${existingVault.toText()}"`);
                 console.log("");
                 return;
               }
@@ -482,7 +482,7 @@ const icStoragePlugin = {
                 console.log(`  Controller:  You (sovereign -- only you can upgrade or delete)`);
                 console.log("");
                 console.log("  Add to your OpenClaw config:");
-                console.log(`    plugins.entries.ic-sovereign-persistent-memory.config.canisterId = "${result.ok.toText()}"`);
+                console.log(`    plugins.entries.openclaw-ic-sovereign-persistent-memory.config.canisterId = "${result.ok.toText()}"`);
                 console.log("");
                 console.log("  Your AI memories are now sovereign and persistent.");
                 console.log("  They live on the Internet Computer and follow you across devices.");
@@ -496,14 +496,39 @@ const icStoragePlugin = {
                 console.error("");
               }
             } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
               console.error("");
-              console.error(`  Setup failed: ${err instanceof Error ? err.message : String(err)}`);
-              console.error("");
-              console.error("  Troubleshooting:");
-              console.error("  - Make sure you have a browser available for Internet Identity auth");
-              console.error("  - Check your internet connection");
-              console.error("  - Try again -- IC mainnet can be temporarily slow");
-              console.error("");
+
+              // Detect Node.js environment issues (no IndexedDB, no browser popup)
+              if (
+                msg.includes("indexedDB is not defined") ||
+                msg.includes("indexedDB") ||
+                msg.includes("browser APIs") ||
+                msg.includes("window is not defined") ||
+                msg.includes("document is not defined")
+              ) {
+                console.error("  Setup requires Internet Identity authentication.");
+                console.error("");
+                console.error("  The @dfinity/auth-client uses browser APIs (IndexedDB) that are not");
+                console.error("  available in this CLI environment.");
+                console.error("");
+                console.error("  Workaround:");
+                console.error("  1. Create your vault at https://nns.ic0.app (IC NNS dashboard)");
+                console.error("  2. Or use the dfx CLI: dfx canister create --wallet <wallet-id>");
+                console.error("  3. Then set your canister ID in config:");
+                console.error(`     openclaw config set plugins.entries.openclaw-ic-sovereign-persistent-memory.config.canisterId "<your-vault-id>"`);
+                console.error("");
+                console.error("  Browser-based setup flow is coming in a future release.");
+                console.error("");
+              } else {
+                console.error(`  Setup failed: ${msg}`);
+                console.error("");
+                console.error("  Troubleshooting:");
+                console.error("  - Make sure you have a browser available for Internet Identity auth");
+                console.error("  - Check your internet connection");
+                console.error("  - Try again -- IC mainnet can be temporarily slow");
+                console.error("");
+              }
             }
           });
 
@@ -523,7 +548,7 @@ const icStoragePlugin = {
               console.log(`  Storage:     ${formatBytes(Number(s.bytesUsed))}`);
               console.log(`  Cycles:      ${formatCycles(Number(s.cycleBalance))}`);
               console.log(
-                `  Last sync:   ${s.lastUpdated === 0n ? "never" : new Date(Number(s.lastUpdated) / 1_000_000).toISOString()}`,
+                `  Last sync:   ${s.lastUpdated === 0n ? "never" : new Date(Number(s.lastUpdated / 1_000_000n)).toISOString()}`,
               );
 
               if (dashboard.recentMemories.length > 0) {
@@ -607,7 +632,7 @@ const icStoragePlugin = {
               for (const e of entries) {
                 const action = Object.keys(e.action)[0];
                 const key = e.key.length > 0 ? e.key[0] : "-";
-                const ts = new Date(Number(e.timestamp) / 1_000_000).toISOString();
+              const ts = new Date(Number(e.timestamp / 1_000_000n)).toISOString();
                 const details = e.details.length > 0 ? ` ${e.details[0]}` : "";
                 console.log(`    ${ts}  [${action}]  key=${key}${details}`);
               }
@@ -623,7 +648,7 @@ const icStoragePlugin = {
     // -- Service --
 
     api.registerService({
-      id: "ic-sovereign-persistent-memory",
+  id: "openclaw-ic-sovereign-persistent-memory",
       start: () => {
         if (cfg.canisterId) {
           api.logger.info(

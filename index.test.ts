@@ -99,6 +99,18 @@ describe("config", () => {
       expect(cfg.canisterId).toBeUndefined();
     });
 
+    it("falls back to default factoryCanisterId for unresolved env var", () => {
+      const cfg = parseConfig({
+        factoryCanisterId: "${NONEXISTENT_FACTORY_VAR}",
+      });
+      // Empty string from unresolved env var should fall back to default, not be ""
+      expect(cfg.factoryCanisterId).toBe("v7tpn-laaaa-aaaac-bcmdq-cai");
+    });
+
+    it("rejects invalid factoryCanisterId format", () => {
+      expect(() => parseConfig({ factoryCanisterId: "INVALID!" })).toThrow("Invalid factoryCanisterId format");
+    });
+
     it("rejects invalid canisterId format", () => {
       expect(() => parseConfig({ canisterId: "INVALID!" })).toThrow("Invalid canisterId format");
     });
@@ -274,7 +286,7 @@ describe("plugin structure", () => {
     const mod = await import("./index.js");
     const plugin = mod.default;
 
-    expect(plugin.id).toBe("ic-sovereign-persistent-memory");
+    expect(plugin.id).toBe("openclaw-ic-sovereign-persistent-memory");
     expect(plugin.name).toBe("IC Sovereign Persistent Memory");
     expect(plugin.kind).toBe("memory");
     expect(typeof plugin.register).toBe("function");
@@ -315,7 +327,7 @@ describe("plugin metadata", () => {
     const raw = fs.readFileSync(metadataPath, "utf-8");
     const metadata = JSON.parse(raw);
 
-    expect(metadata.id).toBe("ic-sovereign-persistent-memory");
+    expect(metadata.id).toBe("openclaw-ic-sovereign-persistent-memory");
     expect(metadata.kind).toBe("memory");
     expect(metadata.configSchema).toBeDefined();
     expect(metadata.configSchema.type).toBe("object");

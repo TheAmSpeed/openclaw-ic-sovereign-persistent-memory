@@ -227,12 +227,16 @@ export async function restoreFromVault(
 
   onProgress?.(`Found ${stats.totalMemories} memories and ${stats.totalSessions} sessions`);
 
-  // Fetch all memories by category
+  // Fetch all memories by category.
+  // recallRelevant has no offset parameter, so we use totalMemories as the limit
+  // to ensure we fetch everything. This is safe because the canister sorts and
+  // returns up to `limit` entries in a single composite query.
   const categories = await client.getCategories();
   const allMemories: LocalMemory[] = [];
+  const memoriesLimit = Math.max(Number(stats.totalMemories), 1000);
 
   for (const cat of categories) {
-    const entries = await client.recallRelevant(cat, null, 10000);
+    const entries = await client.recallRelevant(cat, null, memoriesLimit);
     for (const entry of entries) {
       allMemories.push({
         key: entry.key,

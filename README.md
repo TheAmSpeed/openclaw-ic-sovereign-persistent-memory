@@ -92,7 +92,7 @@ The plugin registers these tools for the AI agent to use directly:
 
 ## Configuration
 
-After setup, config lives in your OpenClaw settings under `plugins.entries.ic-sovereign-persistent-memory.config`:
+After setup, config lives in your OpenClaw settings under `plugins.entries.openclaw-ic-sovereign-persistent-memory.config`:
 
 | Key | Default | Description |
 |---|---|---|

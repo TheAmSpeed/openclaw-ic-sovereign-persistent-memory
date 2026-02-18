@@ -1,5 +1,5 @@
 {
-  "id": "ic-sovereign-persistent-memory",
+  "id": "openclaw-ic-sovereign-persistent-memory",
   "name": "IC Sovereign Persistent Memory",
   "description": "Sovereign, persistent AI memory on the Internet Computer. Your memories live in a personal canister that only you control.",
   "kind": "memory",

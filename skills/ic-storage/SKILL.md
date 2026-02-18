@@ -7,7 +7,7 @@ metadata:
       {
         "emoji": "🏛️",
         "skillKey": "ic-storage",
-        "requires": { "config": ["plugins.entries.ic-sovereign-persistent-memory.enabled"] },
+        "requires": { "config": ["plugins.entries.openclaw-ic-sovereign-persistent-memory.enabled"] },
       },
   }
 ---
@@ -77,7 +77,7 @@ This authenticates with Internet Identity, finds your vault, and downloads all m
 
 ## Configuration
 
-Config lives under `plugins.entries.ic-sovereign-persistent-memory.config`:
+Config lives under `plugins.entries.openclaw-ic-sovereign-persistent-memory.config`:
 
 | Key                 | Default          | Description                               |
 | ------------------- | ---------------- | ----------------------------------------- |

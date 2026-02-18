@@ -77,9 +77,15 @@ export function parseConfig(value: unknown): IcStorageConfig {
     if (typeof raw.factoryCanisterId !== "string") {
       throw new Error("factoryCanisterId must be a string");
     }
-    factoryCanisterId = resolveEnvVars(raw.factoryCanisterId);
-    if (factoryCanisterId && !/^[a-z0-9-]+$/.test(factoryCanisterId)) {
-      throw new Error(`Invalid factoryCanisterId format "${factoryCanisterId}". Expected IC canister ID.`);
+    const resolved = resolveEnvVars(raw.factoryCanisterId);
+    // Fall back to default if env var resolved to empty string
+    if (resolved === "") {
+      factoryCanisterId = DEFAULT_FACTORY_CANISTER_ID;
+    } else {
+      if (!/^[a-z0-9-]+$/.test(resolved)) {
+        throw new Error(`Invalid factoryCanisterId format "${resolved}". Expected IC canister ID.`);
+      }
+      factoryCanisterId = resolved;
     }
   }
 
