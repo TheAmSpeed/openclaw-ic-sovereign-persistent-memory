@@ -8,6 +8,7 @@
     "index.ts",
     "config.ts",
     "ic-client.ts",
+    "identity.ts",
     "prompts.ts",
     "sync.ts",
     "openclaw.plugin.json",
@@ -50,7 +51,6 @@
   "homepage": "https://github.com/TheAmSpeed/openclaw-ic-sovereign-persistent-memory#readme",
   "dependencies": {
     "@dfinity/agent": "^2.3.0",
-    "@dfinity/auth-client": "^2.3.0",
     "@dfinity/candid": "^2.3.0",
     "@dfinity/identity": "^2.3.0",
     "@dfinity/principal": "^2.3.0",
@@ -58,9 +58,9 @@
   },
   "devDependencies": {
     "openclaw": "^2026.2.15",
-    "vitest": "^3.0.0",
+    "oxlint": "^0.16.0",
     "typescript": "^5.7.0",
-    "oxlint": "^0.16.0"
+    "vitest": "^3.0.0"
   },
   "peerDependencies": {
     "openclaw": ">=2026.1.26"

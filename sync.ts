@@ -61,14 +61,6 @@ export function computeSyncDelta(
     return { toSync: localMemories, toSkip: [] };
   }
 
-  // Build local category checksums for comparison
-  const localByCategory = new Map<string, LocalMemory[]>();
-  for (const mem of localMemories) {
-    const list = localByCategory.get(mem.category) ?? [];
-    list.push(mem);
-    localByCategory.set(mem.category, list);
-  }
-
   const toSync: LocalMemory[] = [];
   const toSkip: LocalMemory[] = [];
 
@@ -95,14 +87,6 @@ export function computeSyncDelta(
 /// Batch size for bulk sync calls (avoid exceeding message size limits).
 const BATCH_SIZE = 100;
 
-/// Error class for authentication failures (should not be swallowed).
-class IcAuthError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "IcAuthError";
-  }
-}
-
 /// Perform a full sync of local memories and sessions to the IC vault.
 export async function performSync(
   client: IcClient,
@@ -125,8 +109,8 @@ export async function performSync(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     // Auth errors and network errors should propagate -- don't silently swallow them
-    if (msg.includes("Unauthorized") || msg.includes("Not authenticated")) {
-      throw new IcAuthError(msg);
+    if (msg.includes("Unauthorized") || msg.includes("Not authenticated") || msg.includes("No IC identity")) {
+      throw err instanceof Error ? err : new Error(msg);
     }
     // Only treat "empty vault" type errors as a fresh start
     manifest = {

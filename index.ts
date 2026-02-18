@@ -6,6 +6,15 @@ import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { parseConfig, icStorageConfigSchema, type IcStorageConfig } from "./config.js";
 import { IcClient } from "./ic-client.js";
 import {
+  identityExists,
+  generateAndSaveIdentity,
+  importIdentityFromKey,
+  exportIdentity,
+  getIdentityPath,
+  readKeyFromStdin,
+  loadIdentityAsync,
+} from "./identity.js";
+import {
   loadPromptState,
   savePromptState,
   canPrompt,
@@ -312,7 +321,7 @@ const icStoragePlugin = {
               const key = e.key.length > 0 ? e.key[0] : "-";
               const cat = e.category.length > 0 ? e.category[0] : "-";
               const details = e.details.length > 0 ? e.details[0] : "";
-                const ts = new Date(Number(e.timestamp / 1_000_000n)).toISOString();
+              const ts = new Date(Number(e.timestamp / 1_000_000n)).toISOString();
               return `${ts} [${action}] key=${key} cat=${cat} ${details}`.trim();
             });
 
@@ -382,17 +391,25 @@ const icStoragePlugin = {
       savePromptState(promptState);
     });
 
-    // Auto-sync on session end (placeholder -- actual MemorySearchManager wiring is Phase 2)
+    // Auto-sync on session end: sync any memories the agent stored during this session.
+    // Currently syncs with empty local data to trigger a manifest check and log the event.
+    // Full MemorySearchManager integration (pulling session memories automatically)
+    // is planned for v1.1.
     if (cfg.syncOnSessionEnd) {
       api.on("session_end", async (_event) => {
         if (!cfg.canisterId) return;
-        // Phase 2: wire to MemorySearchManager to pull session memories and sync.
-        // No-op for now -- sync must be triggered manually via vault_sync tool or CLI.
-        api.logger.info("IC Sovereign Memory: session_end hook fired (sync wiring pending Phase 2)");
+        if (!identityExists()) return;
+        try {
+          await performSync(getClient(), [], []);
+        } catch (err) {
+          api.logger.error(
+            `IC Sovereign Memory: session_end sync failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
       });
     }
 
-    // Agent end: sync memories + track memory count for milestone nudges
+    // Agent end: track memory count for milestone nudges + optional auto-sync.
     api.on("agent_end", async (_event) => {
       // Track memory growth for milestone nudges (even if vault isn't configured)
       promptState = loadPromptState();
@@ -400,8 +417,6 @@ const icStoragePlugin = {
       promptState.trackedMemoryCount = previousCount + 1; // approximate: 1 conversation ~ 1 memory
 
       // Check if we should show a milestone nudge
-      // Pass a snapshot with the *previous* count so shouldNudgeForMilestone can detect
-      // that the new count (previousCount + 1) just crossed a milestone threshold.
       if (
         !cfg.canisterId &&
         shouldNudgeForMilestone(
@@ -419,10 +434,17 @@ const icStoragePlugin = {
 
       savePromptState(promptState);
 
-      // Phase 2: wire to MemorySearchManager to pull conversation memories and sync.
-      // No-op for now -- sync must be triggered manually via vault_sync tool or CLI.
-      if (cfg.canisterId && cfg.syncOnAgentEnd) {
-        api.logger.info("IC Sovereign Memory: agent_end hook fired (sync wiring pending Phase 2)");
+      // Auto-sync on agent end if configured and vault is set up.
+      // Syncs with empty local data to trigger manifest check.
+      // Full MemorySearchManager integration planned for v1.1.
+      if (cfg.canisterId && cfg.syncOnAgentEnd && identityExists()) {
+        try {
+          await performSync(getClient(), [], []);
+        } catch (err) {
+          api.logger.error(
+            `IC Sovereign Memory: agent_end sync failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
       }
     });
 
@@ -441,33 +463,41 @@ const icStoragePlugin = {
           .description("Create your sovereign memory vault on the Internet Computer")
           .action(async () => {
             try {
-              const ic = getClient();
               console.log("");
               console.log("  IC Sovereign Persistent Memory -- Setup");
               console.log("  ----------------------------------------");
               console.log("");
-              console.log("  Step 1/3: Authentication");
-              console.log("  Opening Internet Identity in your browser...");
-              console.log("  Sign in with Google, Apple, Microsoft, or a passkey.");
+
+              // Step 1: Identity
+              console.log("  Step 1/3: Identity");
+              let identity;
+              if (identityExists()) {
+                identity = await loadIdentityAsync();
+                console.log(`  Existing identity found.`);
+              } else {
+                identity = await generateAndSaveIdentity();
+                console.log("  Generated new IC identity.");
+                console.log(`  Stored in: ${getIdentityPath()}`);
+              }
+              const principal = identity.getPrincipal();
+              console.log(`  Principal: ${principal.toText()}`);
               console.log("");
 
-              const principal = await ic.authenticate();
-              console.log(`  Authenticated as: ${principal.toText()}`);
-              console.log("");
-
-              // Check if vault exists
+              // Step 2: Check for existing vault
               console.log("  Step 2/3: Checking for existing vault...");
+              const ic = getClient();
+              await ic.initAgentWithIdentity(identity);
               const existingVault = await ic.getVault();
               if (existingVault) {
                 console.log(`  You already have a vault: ${existingVault.toText()}`);
                 console.log("");
                 console.log("  To connect this device, add to your OpenClaw config:");
-                console.log(`    plugins.entries.openclaw-ic-sovereign-persistent-memory.config.canisterId = "${existingVault.toText()}"`);
+                console.log(`    openclaw config set plugins.entries.openclaw-ic-sovereign-persistent-memory.config.canisterId "${existingVault.toText()}"`);
                 console.log("");
                 return;
               }
 
-              // Create vault
+              // Step 3: Create vault
               console.log("  Step 3/3: Creating your sovereign vault...");
               console.log("  This deploys a personal canister on the Internet Computer.");
               console.log("  It takes about 10 seconds.");
@@ -482,7 +512,7 @@ const icStoragePlugin = {
                 console.log(`  Controller:  You (sovereign -- only you can upgrade or delete)`);
                 console.log("");
                 console.log("  Add to your OpenClaw config:");
-                console.log(`    plugins.entries.openclaw-ic-sovereign-persistent-memory.config.canisterId = "${result.ok.toText()}"`);
+                console.log(`    openclaw config set plugins.entries.openclaw-ic-sovereign-persistent-memory.config.canisterId "${result.ok.toText()}"`);
                 console.log("");
                 console.log("  Your AI memories are now sovereign and persistent.");
                 console.log("  They live on the Internet Computer and follow you across devices.");
@@ -498,37 +528,13 @@ const icStoragePlugin = {
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
               console.error("");
-
-              // Detect Node.js environment issues (no IndexedDB, no browser popup)
-              if (
-                msg.includes("indexedDB is not defined") ||
-                msg.includes("indexedDB") ||
-                msg.includes("browser APIs") ||
-                msg.includes("window is not defined") ||
-                msg.includes("document is not defined")
-              ) {
-                console.error("  Setup requires Internet Identity authentication.");
-                console.error("");
-                console.error("  The @dfinity/auth-client uses browser APIs (IndexedDB) that are not");
-                console.error("  available in this CLI environment.");
-                console.error("");
-                console.error("  Workaround:");
-                console.error("  1. Create your vault at https://nns.ic0.app (IC NNS dashboard)");
-                console.error("  2. Or use the dfx CLI: dfx canister create --wallet <wallet-id>");
-                console.error("  3. Then set your canister ID in config:");
-                console.error(`     openclaw config set plugins.entries.openclaw-ic-sovereign-persistent-memory.config.canisterId "<your-vault-id>"`);
-                console.error("");
-                console.error("  Browser-based setup flow is coming in a future release.");
-                console.error("");
-              } else {
-                console.error(`  Setup failed: ${msg}`);
-                console.error("");
-                console.error("  Troubleshooting:");
-                console.error("  - Make sure you have a browser available for Internet Identity auth");
-                console.error("  - Check your internet connection");
-                console.error("  - Try again -- IC mainnet can be temporarily slow");
-                console.error("");
-              }
+              console.error(`  Setup failed: ${msg}`);
+              console.error("");
+              console.error("  Troubleshooting:");
+              console.error("  - Check your internet connection");
+              console.error("  - Try again -- IC mainnet can be temporarily slow");
+              console.error("  - File an issue: https://github.com/TheAmSpeed/openclaw-ic-sovereign-persistent-memory/issues");
+              console.error("");
             }
           });
 
@@ -572,7 +578,11 @@ const icStoragePlugin = {
             try {
               console.log("");
               console.log("  Syncing to IC vault...");
-              // Placeholder: in production, pull local memories from OpenClaw's memory system
+              // Sync triggers a manifest check against the vault.
+              // Memories passed via the vault_sync tool or agent hooks carry data;
+              // the CLI sync command currently verifies connectivity and manifest state.
+              // Full MemorySearchManager integration (auto-pulling local memories)
+              // is planned for v1.1.
               const result = await performSync(getClient(), [], [], (msg) =>
                 console.log(`    ${msg}`),
               );
@@ -632,13 +642,70 @@ const icStoragePlugin = {
               for (const e of entries) {
                 const action = Object.keys(e.action)[0];
                 const key = e.key.length > 0 ? e.key[0] : "-";
-              const ts = new Date(Number(e.timestamp / 1_000_000n)).toISOString();
+                const ts = new Date(Number(e.timestamp / 1_000_000n)).toISOString();
                 const details = e.details.length > 0 ? ` ${e.details[0]}` : "";
                 console.log(`    ${ts}  [${action}]  key=${key}${details}`);
               }
               console.log("");
             } catch (err) {
               console.error(`  Audit failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          });
+
+        vault
+          .command("export-identity")
+          .description("Export your IC identity for use on another device")
+          .action(() => {
+            try {
+              const { secretKeyBase64, principal } = exportIdentity();
+              console.log("");
+              console.log("  IC Sovereign Persistent Memory -- Export Identity");
+              console.log("  -------------------------------------------------");
+              console.log("");
+              console.log(`  Principal: ${principal}`);
+              console.log("");
+              console.log("  Your identity key (keep this secret!):");
+              console.log("");
+              console.log(`    ${secretKeyBase64}`);
+              console.log("");
+              console.log("  To import on another device, run:");
+              console.log("    openclaw ic-memory import-identity");
+              console.log("  Then paste the key above when prompted.");
+              console.log("");
+              console.log("  Or pipe it directly (no shell history):");
+              console.log(`    echo "${secretKeyBase64}" | openclaw ic-memory import-identity`);
+              console.log("");
+              console.log("  WARNING: Anyone with this key has full control of your vault.");
+              console.log("  Store it securely (password manager, encrypted note, etc.).");
+              console.log("");
+            } catch (err) {
+              console.error(`  Export failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          });
+
+        vault
+          .command("import-identity")
+          .description("Import an IC identity from another device (reads key from stdin)")
+          .action(async () => {
+            try {
+              console.log("");
+              console.log("  IC Sovereign Persistent Memory -- Import Identity");
+              console.log("  -------------------------------------------------");
+              console.log("");
+
+              const key = await readKeyFromStdin();
+              const identity = await importIdentityFromKey(key);
+              const principal = identity.getPrincipal();
+              console.log("");
+              console.log(`  Identity imported successfully.`);
+              console.log(`  Principal: ${principal.toText()}`);
+              console.log(`  Stored in: ${getIdentityPath()}`);
+              console.log("");
+              console.log("  You can now access your vault from this device.");
+              console.log("  Run `openclaw ic-memory status` to verify.");
+              console.log("");
+            } catch (err) {
+              console.error(`  Import failed: ${err instanceof Error ? err.message : String(err)}`);
             }
           });
       },

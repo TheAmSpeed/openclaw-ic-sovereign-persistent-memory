@@ -1,6 +1,5 @@
 import Types "Types";
 import Array "mo:base/Array";
-import Buffer "mo:base/Buffer";
 import Nat "mo:base/Nat";
 import Int "mo:base/Int";
 import Text "mo:base/Text";
@@ -12,7 +11,7 @@ import ExperimentalCycles "mo:base/ExperimentalCycles";
 
 
 /// Per-user persistent vault canister.
-/// Uses Trie (functional, stable) for maps, Buffer for audit log.
+/// Uses Trie (functional, stable) for maps, arrays for audit log (EOP-compatible).
 /// All vars persist across upgrades via Enhanced Orthogonal Persistence.
 persistent actor class UserVault(initOwner : Principal) {
 
@@ -37,8 +36,8 @@ persistent actor class UserVault(initOwner : Principal) {
   var sessions : Trie.Trie<Text, Types.SessionEntry> = Trie.empty();
 
   // Immutable audit log -- append-only, never modified.
-  // Uses Buffer for O(1) amortized appends (replaces O(n) Array.append).
-  var auditLogBuf : Buffer.Buffer<Types.AuditEntry> = Buffer.Buffer<Types.AuditEntry>(64);
+  // Stored as a stable array for EOP (Enhanced Orthogonal Persistence) compatibility.
+  var auditLog : [Types.AuditEntry] = [];
 
   var lastUpdated : Int = 0;
 
@@ -130,24 +129,22 @@ persistent actor class UserVault(initOwner : Principal) {
   };
 
   /// Append an entry to the immutable audit log with FIFO eviction.
+  /// Uses Array.append (O(n) per call) but amortized by 10% batch eviction.
+  /// Buffer.Buffer is not a stable type in persistent actors (EOP), so we use arrays.
   func appendAudit(entry : Types.AuditEntry) {
     // FIFO eviction: if at max size, remove oldest 10% to amortize
-    if (auditLogBuf.size() >= MAX_AUDIT_LOG_SIZE) {
+    if (auditLog.size() >= MAX_AUDIT_LOG_SIZE) {
       let evictCount = MAX_AUDIT_LOG_SIZE / 10; // remove 10%
       // Decrement bytesUsed for evicted entries
       let evictedBytes = evictCount * 128;
       bytesUsed := if (bytesUsed >= evictedBytes) { bytesUsed - evictedBytes } else { 0 };
 
-      let remaining = auditLogBuf.size() - evictCount;
-      let newBuf = Buffer.Buffer<Types.AuditEntry>(remaining + 64);
-      var i = evictCount;
-      while (i < auditLogBuf.size()) {
-        newBuf.add(auditLogBuf.get(i));
-        i += 1;
-      };
-      auditLogBuf := newBuf;
+      let remaining = auditLog.size() - evictCount;
+      auditLog := Array.tabulate<Types.AuditEntry>(remaining, func(i) {
+        auditLog[evictCount + i];
+      });
     };
-    auditLogBuf.add(entry);
+    auditLog := Array.append(auditLog, [entry]);
     // Update bytesUsed estimate for audit entries
     bytesUsed += 128;
   };
@@ -168,17 +165,17 @@ persistent actor class UserVault(initOwner : Principal) {
 
   /// Validate input sizes. Returns error text if invalid, null if OK.
   func validateMemoryInput(key : Text, category : Text, content : Blob, metadata : Text) : ?Text {
-    if (key.size() > MAX_KEY_SIZE) { return ?"key exceeds " # Nat.toText(MAX_KEY_SIZE) # " byte limit" };
-    if (category.size() > MAX_CATEGORY_SIZE) { return ?"category exceeds " # Nat.toText(MAX_CATEGORY_SIZE) # " byte limit" };
-    if (content.size() > MAX_CONTENT_SIZE) { return ?"content exceeds " # Nat.toText(MAX_CONTENT_SIZE) # " byte limit (1 MB)" };
-    if (metadata.size() > MAX_METADATA_SIZE) { return ?"metadata exceeds " # Nat.toText(MAX_METADATA_SIZE) # " byte limit (64 KB)" };
+    if (key.size() > MAX_KEY_SIZE) { return ?("key exceeds " # Nat.toText(MAX_KEY_SIZE) # " byte limit") };
+    if (category.size() > MAX_CATEGORY_SIZE) { return ?("category exceeds " # Nat.toText(MAX_CATEGORY_SIZE) # " byte limit") };
+    if (content.size() > MAX_CONTENT_SIZE) { return ?("content exceeds " # Nat.toText(MAX_CONTENT_SIZE) # " byte limit (1 MB)") };
+    if (metadata.size() > MAX_METADATA_SIZE) { return ?("metadata exceeds " # Nat.toText(MAX_METADATA_SIZE) # " byte limit (64 KB)") };
     null;
   };
 
   /// Validate session input sizes. Returns error text if invalid, null if OK.
   func validateSessionInput(sessionId : Text, data : Blob) : ?Text {
-    if (sessionId.size() > MAX_KEY_SIZE) { return ?"sessionId exceeds " # Nat.toText(MAX_KEY_SIZE) # " byte limit" };
-    if (data.size() > MAX_SESSION_DATA_SIZE) { return ?"session data exceeds " # Nat.toText(MAX_SESSION_DATA_SIZE) # " byte limit (1 MB)" };
+    if (sessionId.size() > MAX_KEY_SIZE) { return ?("sessionId exceeds " # Nat.toText(MAX_KEY_SIZE) # " byte limit") };
+    if (data.size() > MAX_SESSION_DATA_SIZE) { return ?("session data exceeds " # Nat.toText(MAX_SESSION_DATA_SIZE) # " byte limit (1 MB)") };
     null;
   };
 
@@ -386,18 +383,18 @@ persistent actor class UserVault(initOwner : Principal) {
 
     var stored : Nat = 0;
     var skipped : Nat = 0;
-    let errorsBuf = Buffer.Buffer<Text>(4);
+    var errors : [Text] = [];
 
     // Sync memories
     for (input in memoryInputs.vals()) {
       if (input.key == "" or input.category == "") {
-        errorsBuf.add("Skipped memory with empty key or category");
+        errors := Array.append(errors, ["Skipped memory with empty key or category"]);
         skipped += 1;
       } else {
         // Validate input sizes
         switch (validateMemoryInput(input.key, input.category, input.content, input.metadata)) {
           case (?errMsg) {
-            errorsBuf.add("Skipped " # input.key # ": " # errMsg);
+            errors := Array.append(errors, ["Skipped " # input.key # ": " # errMsg]);
             skipped += 1;
           };
           case null {
@@ -468,13 +465,13 @@ persistent actor class UserVault(initOwner : Principal) {
     // Sync sessions
     for (input in sessionInputs.vals()) {
       if (input.sessionId == "") {
-        errorsBuf.add("Skipped session with empty sessionId");
+        errors := Array.append(errors, ["Skipped session with empty sessionId"]);
         skipped += 1;
       } else {
         // Validate session input sizes
         switch (validateSessionInput(input.sessionId, input.data)) {
           case (?errMsg) {
-            errorsBuf.add("Skipped session " # input.sessionId # ": " # errMsg);
+            errors := Array.append(errors, ["Skipped session " # input.sessionId # ": " # errMsg]);
             skipped += 1;
           };
           case null {
@@ -543,7 +540,7 @@ persistent actor class UserVault(initOwner : Principal) {
     #ok({
       stored = stored;
       skipped = skipped;
-      errors = Buffer.toArray(errorsBuf);
+      errors = errors;
     });
   };
 
@@ -655,16 +652,16 @@ persistent actor class UserVault(initOwner : Principal) {
   /// Get paginated audit log entries (chronological order).
   public query ({ caller }) func getAuditLog(offset : Nat, limit : Nat) : async Result.Result<[Types.AuditEntry], Types.VaultError> {
     if (caller != owner) { return #err(#unauthorized) };
-    let size = auditLogBuf.size();
+    let size = auditLog.size();
     if (offset >= size) { return #ok([]) };
     let end = if (offset + limit > size) { size } else { offset + limit };
-    #ok(Array.tabulate<Types.AuditEntry>(end - offset, func(i) { auditLogBuf.get(offset + i) }));
+    #ok(Array.tabulate<Types.AuditEntry>(end - offset, func(i) { auditLog[offset + i] }));
   };
 
   /// Get total audit log size.
   public query ({ caller }) func getAuditLogSize() : async Result.Result<Nat, Types.VaultError> {
     if (caller != owner) { return #err(#unauthorized) };
-    #ok(auditLogBuf.size());
+    #ok(auditLog.size());
   };
 
   /// Get vault owner principal (owner-only to prevent privacy leak).
@@ -695,7 +692,7 @@ persistent actor class UserVault(initOwner : Principal) {
     if (caller != owner) { return #err(#unauthorized) };
 
     // Collect all matches first
-    let matchBuf = Buffer.Buffer<Types.MemoryEntry>(64);
+    var matches : [Types.MemoryEntry] = [];
     for ((_, entry) in Trie.iter(memories)) {
       let catMatch = switch (category) {
         case (?c) { entry.category == c };
@@ -706,12 +703,11 @@ persistent actor class UserVault(initOwner : Principal) {
         case null { true };
       };
       if (catMatch and prefixMatch) {
-        matchBuf.add(entry);
+        matches := Array.append(matches, [entry]);
       };
     };
 
     // Sort by updatedAt descending (most recent first)
-    let matches = Buffer.toArray(matchBuf);
     let sorted = Array.sort<Types.MemoryEntry>(matches, func(a, b) {
       if (a.updatedAt > b.updatedAt) { #less }
       else if (a.updatedAt < b.updatedAt) { #greater }

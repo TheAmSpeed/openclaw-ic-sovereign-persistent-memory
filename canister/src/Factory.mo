@@ -1,11 +1,9 @@
 import Types "Types";
 import Array "mo:base/Array";
-import Buffer "mo:base/Buffer";
 import Nat "mo:base/Nat";
 import Principal "mo:base/Principal";
 import Result "mo:base/Result";
 import Trie "mo:base/Trie";
-import Text "mo:base/Text";
 import ExperimentalCycles "mo:base/ExperimentalCycles";
 import Time "mo:base/Time";
 
@@ -48,8 +46,8 @@ persistent actor Factory {
   var vaultsTrie : Trie.Trie<Principal, Principal> = Trie.empty();
   var totalCreated : Nat = 0;
 
-  // Audit log for factory operations (Buffer for O(1) amortized appends)
-  var auditLogBuf : Buffer.Buffer<Types.AuditEntry> = Buffer.Buffer<Types.AuditEntry>(16);
+  // Audit log for factory operations (array for EOP compatibility)
+  var auditLog : [Types.AuditEntry] = [];
 
   // -- Internal helpers --
 
@@ -75,7 +73,7 @@ persistent actor Factory {
 
   /// Append to factory audit log.
   func appendAudit(entry : Types.AuditEntry) {
-    auditLogBuf.add(entry);
+    auditLog := Array.append(auditLog, [entry]);
   };
 
   // -- Public API --

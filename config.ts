@@ -105,7 +105,7 @@ export const icStorageConfigSchema = {
     canisterId: {
       label: "Vault Canister ID",
       placeholder: "e.g. uxrrr-q7777-77774-qaaaq-cai",
-      help: "Set automatically by /vault-setup.",
+      help: "Set automatically by `openclaw ic-memory setup`.",
     },
     factoryCanisterId: {
       label: "Factory Canister ID",

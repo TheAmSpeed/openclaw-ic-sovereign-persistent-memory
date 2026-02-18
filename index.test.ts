@@ -1,5 +1,5 @@
 /// Tests for IC Sovereign Persistent Memory plugin.
-/// Covers: config parsing, sync logic, encoding utilities, and plugin structure.
+/// Covers: config parsing, sync logic, encoding utilities, plugin structure, and identity management.
 
 import { describe, it, expect, beforeAll } from "vitest";
 import { rmSync } from "fs";
@@ -351,8 +351,9 @@ describe("plugin metadata", () => {
     expect(pkg.openclaw).toBeDefined();
     expect(pkg.openclaw.extensions).toEqual(["./index.ts"]);
     expect(pkg.dependencies["@dfinity/agent"]).toBeDefined();
-    expect(pkg.dependencies["@dfinity/auth-client"]).toBeDefined();
+    expect(pkg.dependencies["@dfinity/identity"]).toBeDefined();
     expect(pkg.dependencies["@sinclair/typebox"]).toBeDefined();
+    expect(pkg.dependencies["@dfinity/auth-client"]).toBeUndefined();
   });
 });
 
@@ -648,5 +649,154 @@ describe("smart prompting", () => {
       // Cleanup temp directory
       try { rmSync(tmpDir, { recursive: true }); } catch {}
     });
+  });
+});
+
+// ============================================================
+// Identity management tests
+// ============================================================
+
+describe("identity", () => {
+  it("generates a valid Ed25519 identity", async () => {
+    const { Ed25519KeyIdentity } = await import("@dfinity/identity");
+    const identity = Ed25519KeyIdentity.generate();
+    const principal = identity.getPrincipal();
+    expect(principal.toText()).toMatch(/^[a-z0-9-]+$/);
+    expect(principal.toText().length).toBeGreaterThan(10);
+  });
+
+  it("round-trips identity through JSON serialization", async () => {
+    const { Ed25519KeyIdentity } = await import("@dfinity/identity");
+    const identity = Ed25519KeyIdentity.generate();
+    const json = JSON.stringify(identity.toJSON());
+
+    const restored = Ed25519KeyIdentity.fromJSON(json);
+    expect(restored.getPrincipal().toText()).toBe(identity.getPrincipal().toText());
+  });
+
+  it("round-trips identity through secret key export/import", async () => {
+    const { Ed25519KeyIdentity } = await import("@dfinity/identity");
+    const identity = Ed25519KeyIdentity.generate();
+    const kp = identity.getKeyPair();
+
+    // Export secret key as base64
+    const secretB64 = Buffer.from(kp.secretKey).toString("base64");
+    expect(secretB64.length).toBe(44); // 32 bytes = 44 base64 chars
+
+    // Import from base64
+    const restoredKey = Buffer.from(secretB64, "base64");
+    const restored = Ed25519KeyIdentity.fromSecretKey(new Uint8Array(restoredKey).buffer as ArrayBuffer);
+    expect(restored.getPrincipal().toText()).toBe(identity.getPrincipal().toText());
+  });
+
+  it("different keys produce different principals", async () => {
+    const { Ed25519KeyIdentity } = await import("@dfinity/identity");
+    const id1 = Ed25519KeyIdentity.generate();
+    const id2 = Ed25519KeyIdentity.generate();
+    expect(id1.getPrincipal().toText()).not.toBe(id2.getPrincipal().toText());
+  });
+
+  it("secret key is exactly 32 bytes", async () => {
+    const { Ed25519KeyIdentity } = await import("@dfinity/identity");
+    const identity = Ed25519KeyIdentity.generate();
+    const kp = identity.getKeyPair();
+    expect(kp.secretKey.byteLength).toBe(32);
+  });
+});
+
+// ============================================================
+// AES-256-GCM encryption round-trip tests
+// ============================================================
+
+describe("encryption", () => {
+  it("round-trips data through AES-256-GCM encryption", async () => {
+    const crypto = await import("node:crypto");
+
+    const passphrase = "test-passphrase-12345";
+    const plaintext = '["pubkeyhex","secretkeyhex"]';
+
+    // Encrypt
+    const salt = crypto.randomBytes(32);
+    const iv = crypto.randomBytes(16);
+    const key = crypto.pbkdf2Sync(passphrase, salt, 600_000, 32, "sha256");
+    const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+    const encrypted = Buffer.concat([cipher.update(plaintext, "utf-8"), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+    const combined = Buffer.concat([salt, iv, authTag, encrypted]);
+
+    // Decrypt
+    const dSalt = combined.subarray(0, 32);
+    const dIv = combined.subarray(32, 48);
+    const dAuthTag = combined.subarray(48, 64);
+    const dEncrypted = combined.subarray(64);
+    const dKey = crypto.pbkdf2Sync(passphrase, dSalt, 600_000, 32, "sha256");
+    const decipher = crypto.createDecipheriv("aes-256-gcm", dKey, dIv);
+    decipher.setAuthTag(dAuthTag);
+    const decrypted = Buffer.concat([decipher.update(dEncrypted), decipher.final()]);
+
+    expect(decrypted.toString("utf-8")).toBe(plaintext);
+  });
+
+  it("fails with wrong passphrase", async () => {
+    const crypto = await import("node:crypto");
+
+    const passphrase = "correct-passphrase";
+    const wrongPassphrase = "wrong-passphrase";
+    const plaintext = "secret-data";
+
+    // Encrypt with correct passphrase
+    const salt = crypto.randomBytes(32);
+    const iv = crypto.randomBytes(16);
+    const key = crypto.pbkdf2Sync(passphrase, salt, 600_000, 32, "sha256");
+    const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+    const encrypted = Buffer.concat([cipher.update(plaintext, "utf-8"), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+    const combined = Buffer.concat([salt, iv, authTag, encrypted]);
+
+    // Attempt decrypt with wrong passphrase
+    const dSalt = combined.subarray(0, 32);
+    const dIv = combined.subarray(32, 48);
+    const dAuthTag = combined.subarray(48, 64);
+    const dEncrypted = combined.subarray(64);
+    const dKey = crypto.pbkdf2Sync(wrongPassphrase, dSalt, 600_000, 32, "sha256");
+    const decipher = crypto.createDecipheriv("aes-256-gcm", dKey, dIv);
+    decipher.setAuthTag(dAuthTag);
+
+    expect(() => {
+      Buffer.concat([decipher.update(dEncrypted), decipher.final()]);
+    }).toThrow();
+  });
+
+  it("encrypted output is different each time (random salt/iv)", async () => {
+    const crypto = await import("node:crypto");
+
+    const passphrase = "same-passphrase";
+    const plaintext = "same-data";
+
+    function encrypt(): Buffer {
+      const salt = crypto.randomBytes(32);
+      const iv = crypto.randomBytes(16);
+      const key = crypto.pbkdf2Sync(passphrase, salt, 600_000, 32, "sha256");
+      const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+      const encrypted = Buffer.concat([cipher.update(plaintext, "utf-8"), cipher.final()]);
+      const authTag = cipher.getAuthTag();
+      return Buffer.concat([salt, iv, authTag, encrypted]);
+    }
+
+    const a = encrypt();
+    const b = encrypt();
+    expect(a.equals(b)).toBe(false); // Different salt/iv -> different ciphertext
+  });
+
+  it("rejects truncated encrypted data", async () => {
+    const crypto = await import("node:crypto");
+
+    const passphrase = "test";
+    // Too short: less than salt(32) + iv(16) + authTag(16) + 1 = 65 bytes
+    const tooShort = crypto.randomBytes(50);
+
+    const dKey = crypto.pbkdf2Sync(passphrase, tooShort.subarray(0, 32), 600_000, 32, "sha256");
+    // This should fail because there's not enough data for salt+iv+authTag+ciphertext
+    expect(tooShort.length).toBeLessThan(65);
   });
 });

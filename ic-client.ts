@@ -1,11 +1,12 @@
 /// @dfinity/agent wrapper for IC Sovereign Persistent Memory.
-/// Handles authentication (II 2.0), agent creation, and canister calls.
+/// Handles authentication (Ed25519KeyIdentity), agent creation, and canister calls.
 
 import { Actor, HttpAgent } from "@dfinity/agent";
-import { AuthClient } from "@dfinity/auth-client";
+import type { Identity } from "@dfinity/agent";
 import { IDL } from "@dfinity/candid";
 import { Principal } from "@dfinity/principal";
 import type { IcStorageConfig } from "./config.js";
+import { loadIdentityAsync, identityExists } from "./identity.js";
 
 // -- Candid IDL definitions for our canisters --
 
@@ -257,9 +258,8 @@ function unwrapResult<T>(result: { ok: T } | { err: unknown }, context: string):
 
 export class IcClient {
   private agent: HttpAgent | null = null;
-  private authClient: AuthClient | null = null;
+  private identity: Identity | null = null;
   private config: IcStorageConfig;
-  private authenticated = false;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- cached actor; methods accessed dynamically
   private cachedVaultActor: any = null;
 
@@ -272,12 +272,21 @@ export class IcClient {
     return this.config.network === "local" ? "http://127.0.0.1:4943" : "https://icp0.io";
   }
 
-  /// Initialize the HTTP agent (unauthenticated for queries).
+  /// Load the Ed25519 identity from disk and create an authenticated HttpAgent.
   async initAgent(): Promise<HttpAgent> {
     if (this.agent) return this.agent;
 
+    if (!identityExists()) {
+      throw new Error(
+        "No IC identity found. Run `openclaw ic-memory setup` to create one.",
+      );
+    }
+
+    this.identity = await loadIdentityAsync();
+
     this.agent = await HttpAgent.create({
       host: this.getHost(),
+      identity: this.identity,
     });
 
     // Fetch root key for local dev (required by PocketIC)
@@ -285,42 +294,15 @@ export class IcClient {
       await this.agent.fetchRootKey();
     }
 
-    // Mark as NOT authenticated -- this is an unauthenticated agent
-    this.authenticated = false;
-
     return this.agent;
   }
 
-  /// Initialize authenticated agent via Internet Identity.
-  async initAuthenticatedAgent(): Promise<HttpAgent> {
-    // Guard: AuthClient uses IndexedDB which is only available in browser environments
-    if (typeof globalThis.indexedDB === "undefined") {
-      throw new Error(
-        "Authentication requires browser APIs (IndexedDB) not available in this environment. " +
-        "Configure your canister ID manually -- see `openclaw ic-memory setup` for instructions.",
-      );
-    }
-    try {
-      this.authClient = await AuthClient.create();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("indexedDB") || msg.includes("window") || msg.includes("document")) {
-        throw new Error(
-          "Authentication requires browser APIs (IndexedDB) not available in this environment. " +
-          "Configure your canister ID manually -- see `openclaw ic-memory setup` for instructions.",
-        );
-      }
-      throw err;
-    }
+  /// Initialize an agent with a specific identity (used by setup flow before
+  /// the identity file is written to the standard location).
+  async initAgentWithIdentity(identity: Identity): Promise<HttpAgent> {
+    this.identity = identity;
+    this.cachedVaultActor = null;
 
-    const isAuthenticated = await this.authClient.isAuthenticated();
-    if (!isAuthenticated) {
-      throw new Error(
-        "Not authenticated. Please run `openclaw ic-memory setup` to authenticate with Internet Identity.",
-      );
-    }
-
-    const identity = this.authClient.getIdentity();
     this.agent = await HttpAgent.create({
       host: this.getHost(),
       identity,
@@ -330,85 +312,24 @@ export class IcClient {
       await this.agent.fetchRootKey();
     }
 
-    this.authenticated = true;
-    this.cachedVaultActor = null; // invalidate cached actor on new agent
-
     return this.agent;
   }
 
-  /// Authenticate with Internet Identity 2.0.
-  /// Returns the principal after successful auth.
-  async authenticate(): Promise<Principal> {
-    // Guard: AuthClient uses IndexedDB which is only available in browser environments
-    if (typeof globalThis.indexedDB === "undefined") {
-      throw new Error(
-        "Internet Identity authentication requires browser APIs (IndexedDB) not available in this CLI environment. " +
-        "See the setup instructions for manual canister ID configuration.",
-      );
-    }
-    try {
-      this.authClient = await AuthClient.create();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("indexedDB") || msg.includes("window") || msg.includes("document")) {
-        throw new Error(
-          "Internet Identity authentication requires browser APIs (IndexedDB) not available in this CLI environment. " +
-          "See the setup instructions for manual canister ID configuration.",
-        );
-      }
-      throw err;
-    }
-
-    return new Promise((resolve, reject) => {
-      this.authClient!.login({
-        identityProvider:
-          this.config.network === "local"
-            ? `http://127.0.0.1:4943?canisterId=rdmx6-jaaaa-aaaaa-aaadq-cai`
-            : "https://identity.ic0.app",
-        onSuccess: async () => {
-          const identity = this.authClient!.getIdentity();
-          const principal = identity.getPrincipal();
-
-          this.agent = await HttpAgent.create({
-            host: this.getHost(),
-            identity,
-          });
-
-          if (this.config.network === "local") {
-            await this.agent.fetchRootKey();
-          }
-
-          this.authenticated = true;
-          this.cachedVaultActor = null; // invalidate on new auth
-
-          resolve(principal);
-        },
-        onError: (error) => {
-          reject(new Error(`Authentication failed: ${error}`));
-        },
-      });
-    });
+  /// Get the principal of the current identity.
+  getPrincipal(): Principal | null {
+    return this.identity?.getPrincipal() ?? null;
   }
 
-  /// Check if user is currently authenticated.
-  async isAuthenticated(): Promise<boolean> {
-    if (typeof globalThis.indexedDB === "undefined") return false;
-    try {
-      if (!this.authClient) {
-        this.authClient = await AuthClient.create();
-      }
-      return this.authClient.isAuthenticated();
-    } catch {
-      // AuthClient.create() fails in non-browser environments (no IndexedDB)
-      return false;
-    }
+  /// Check if an identity is available (key file exists).
+  hasIdentity(): boolean {
+    return identityExists();
   }
 
   // -- Factory methods --
 
   /// Create a vault for the current user.
   async createVault(): Promise<{ ok: Principal } | { err: string }> {
-    const agent = await this.getAuthenticatedAgent();
+    const agent = await this.getAgent();
     if (!this.config.factoryCanisterId) {
       return { err: "Factory canister ID not configured" };
     }
@@ -438,7 +359,7 @@ export class IcClient {
 
   /// Look up the caller's vault.
   async getVault(): Promise<Principal | null> {
-    const agent = await this.getAuthenticatedAgent();
+    const agent = await this.getAgent();
     if (!this.config.factoryCanisterId) return null;
 
     const factory = Actor.createActor(factoryIdlFactory, {
@@ -453,7 +374,7 @@ export class IcClient {
   /// Revoke Factory's controller access to the caller's vault.
   /// Makes the vault fully sovereign -- only the owner is a controller.
   async revokeFactoryController(): Promise<{ ok: null } | { err: string }> {
-    const agent = await this.getAuthenticatedAgent();
+    const agent = await this.getAgent();
     if (!this.config.factoryCanisterId) {
       return { err: "Factory canister ID not configured" };
     }
@@ -492,7 +413,7 @@ export class IcClient {
     return { err: this.formatVaultError(result.err) };
   }
 
-  /// Recall a specific memory. Now unwraps Result from query.
+  /// Recall a specific memory. Unwraps Result from query.
   async recall(key: string): Promise<MemoryEntryData | null> {
     const actor = await this.getVaultActor();
     const result = (await actor.recall(key)) as
@@ -625,10 +546,9 @@ export class IcClient {
 
   // -- Internal helpers --
 
-  private async getAuthenticatedAgent(): Promise<HttpAgent> {
-    // Only return cached agent if it was created with authentication
-    if (this.agent && this.authenticated) return this.agent;
-    return this.initAuthenticatedAgent();
+  private async getAgent(): Promise<HttpAgent> {
+    if (this.agent) return this.agent;
+    return this.initAgent();
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Actor.createActor returns untyped actor; methods accessed dynamically
@@ -640,7 +560,7 @@ export class IcClient {
     // Return cached actor if agent hasn't changed
     if (this.cachedVaultActor) return this.cachedVaultActor;
 
-    const agent = await this.getAuthenticatedAgent();
+    const agent = await this.getAgent();
     this.cachedVaultActor = Actor.createActor(userVaultIdlFactory, {
       agent,
       canisterId: this.config.canisterId,
