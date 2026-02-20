@@ -255,11 +255,11 @@ export function readLocalMemories(workspaceDir?: string): LocalMemory[] {
       if (seenKeys.has(key)) continue;
       seenKeys.add(key);
 
-      // Get file mtime for timestamp
+      // Get file mtime for timestamp (floor to integer -- BigInt conversion requires integers)
       let mtimeMs = nowMs;
       try {
         const stat = fs.statSync(filePath);
-        mtimeMs = stat.mtimeMs;
+        mtimeMs = Math.floor(stat.mtimeMs);
       } catch {
         // Use now as fallback
       }
