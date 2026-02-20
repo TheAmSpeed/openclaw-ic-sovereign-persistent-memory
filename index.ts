@@ -10,6 +10,7 @@ import {
   generateAndSaveIdentity,
   importIdentityFromKey,
   exportIdentity,
+  deleteIdentity,
   getIdentityPath,
   readKeyFromStdin,
   loadIdentityAsync,
@@ -25,6 +26,12 @@ import {
   getSetupCompleteMessage,
 } from "./prompts.js";
 import { performSync, restoreFromVault, decodeContent, type LocalMemory } from "./sync.js";
+import {
+  readLocalMemories,
+  extractMemoriesFromMessages,
+  formatMemoriesAsContext,
+  deriveSearchTerms,
+} from "./memory-reader.js";
 
 const icStoragePlugin = {
       id: "openclaw-ic-sovereign-persistent-memory",
@@ -391,16 +398,71 @@ const icStoragePlugin = {
       savePromptState(promptState);
     });
 
-    // Auto-sync on session end: sync any memories the agent stored during this session.
-    // Currently syncs with empty local data to trigger a manifest check and log the event.
-    // Full MemorySearchManager integration (pulling session memories automatically)
-    // is planned for v1.1.
+    // Smart Memory Recall: inject relevant IC vault memories before agent starts.
+    // This solves the "OpenClaw forgets" problem by pre-loading relevant context
+    // from the IC vault into every conversation -- surviving compaction, session resets,
+    // and working across devices.
+    api.on("before_agent_start", async (event, ctx) => {
+      if (!cfg.canisterId) return;
+      if (!identityExists()) return;
+
+      const prompt = (event as { prompt?: string }).prompt;
+      if (!prompt) return;
+
+      try {
+        const ic = getClient();
+        const { categories, prefixes } = deriveSearchTerms(prompt);
+
+        // Recall relevant memories from IC vault
+        const recalled: Array<{ key: string; category: string; content: Uint8Array }> = [];
+        const RECALL_LIMIT = 10;
+
+        if (categories.length > 0) {
+          // Search by matched categories
+          for (const category of categories.slice(0, 3)) {
+            const prefix = prefixes.length > 0 ? prefixes[0] : null;
+            const entries = await ic.recallRelevant(category, prefix, RECALL_LIMIT);
+            recalled.push(...entries);
+          }
+        } else {
+          // Broad recall -- get recent memories across all categories
+          const entries = await ic.recallRelevant(null, null, RECALL_LIMIT);
+          recalled.push(...entries);
+        }
+
+        if (recalled.length === 0) return;
+
+        // Deduplicate by key
+        const seen = new Set<string>();
+        const unique = recalled.filter((m) => {
+          if (seen.has(m.key)) return false;
+          seen.add(m.key);
+          return true;
+        });
+
+        const context = formatMemoriesAsContext(unique);
+        if (!context) return;
+
+        return { prependContext: context };
+      } catch (err) {
+        // Fail silently -- recall is best-effort. The agent should still work
+        // even if the IC vault is temporarily unreachable.
+        api.logger.error(
+          `IC Sovereign Memory: recall failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    });
+
+    // Auto-sync on session end: read local memory files and sync to IC vault.
+    // session_end provides sessionId, messageCount, and durationMs (no messages or workspaceDir),
+    // so we read from the default workspace path.
     if (cfg.syncOnSessionEnd) {
       api.on("session_end", async (_event) => {
         if (!cfg.canisterId) return;
         if (!identityExists()) return;
         try {
-          await performSync(getClient(), [], []);
+          const localMemories = readLocalMemories();
+          await performSync(getClient(), localMemories, []);
         } catch (err) {
           api.logger.error(
             `IC Sovereign Memory: session_end sync failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -409,8 +471,46 @@ const icStoragePlugin = {
       });
     }
 
-    // Agent end: track memory count for milestone nudges + optional auto-sync.
-    api.on("agent_end", async (_event) => {
+    // Pre-Compaction Memory Flush: save memories to IC vault BEFORE compaction destroys context.
+    // This directly addresses Failure Mode 3 from the OpenClaw memory problem:
+    // compaction summarizes/removes older messages, and anything not yet saved to disk is lost.
+    api.on("before_compaction", async (event, ctx) => {
+      if (!cfg.canisterId) return;
+      if (!identityExists()) return;
+
+      try {
+        const typedEvent = event as {
+          messages?: unknown[];
+          sessionFile?: string;
+          messageCount?: number;
+        };
+        const workspaceDir = (ctx as { workspaceDir?: string }).workspaceDir;
+
+        // Strategy: Read local memory files (which may have been updated by OpenClaw's
+        // memoryFlush) AND extract memories from conversation messages.
+        const localMemories = readLocalMemories(workspaceDir ?? undefined);
+
+        // Also extract from conversation messages if available
+        const messageMemories = typedEvent.messages
+          ? extractMemoriesFromMessages(typedEvent.messages)
+          : [];
+
+        const allMemories = [...localMemories, ...messageMemories];
+
+        if (allMemories.length === 0) return;
+
+        await performSync(getClient(), allMemories, []);
+      } catch (err) {
+        api.logger.error(
+          `IC Sovereign Memory: before_compaction sync failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    });
+
+    // Agent end: track memory count for milestone nudges + auto-capture and sync.
+    // Reads local memory files and extracts memories from conversation messages,
+    // then syncs everything to the IC vault.
+    api.on("agent_end", async (event) => {
       // Track memory growth for milestone nudges (even if vault isn't configured)
       promptState = loadPromptState();
       const previousCount = promptState.trackedMemoryCount;
@@ -434,12 +534,24 @@ const icStoragePlugin = {
 
       savePromptState(promptState);
 
-      // Auto-sync on agent end if configured and vault is set up.
-      // Syncs with empty local data to trigger manifest check.
-      // Full MemorySearchManager integration planned for v1.1.
+      // Auto-capture and sync: read local memory files + extract from conversation messages.
       if (cfg.canisterId && cfg.syncOnAgentEnd && identityExists()) {
         try {
-          await performSync(getClient(), [], []);
+          const typedEvent = event as {
+            messages?: unknown[];
+          };
+
+          // Read local memory files (MEMORY.md, memory/*.md)
+          const localMemories = readLocalMemories();
+
+          // Extract additional memories from the conversation messages
+          const messageMemories = typedEvent.messages
+            ? extractMemoriesFromMessages(typedEvent.messages)
+            : [];
+
+          const allMemories = [...localMemories, ...messageMemories];
+
+          await performSync(getClient(), allMemories, []);
         } catch (err) {
           api.logger.error(
             `IC Sovereign Memory: agent_end sync failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -577,13 +689,22 @@ const icStoragePlugin = {
           .action(async () => {
             try {
               console.log("");
-              console.log("  Syncing to IC vault...");
-              // Sync triggers a manifest check against the vault.
-              // Memories passed via the vault_sync tool or agent hooks carry data;
-              // the CLI sync command currently verifies connectivity and manifest state.
-              // Full MemorySearchManager integration (auto-pulling local memories)
-              // is planned for v1.1.
-              const result = await performSync(getClient(), [], [], (msg) =>
+              console.log("  Syncing local memories to IC vault...");
+
+              // Read all local OpenClaw memory files
+              const localMemories = readLocalMemories();
+              console.log(`  Found ${localMemories.length} memory entries from local files`);
+
+              if (localMemories.length === 0) {
+                console.log("");
+                console.log("  No local memories found to sync.");
+                console.log("  Memory files are stored in ~/.openclaw/workspace/MEMORY.md");
+                console.log("  and ~/.openclaw/workspace/memory/*.md");
+                console.log("");
+                return;
+              }
+
+              const result = await performSync(getClient(), localMemories, [], (msg) =>
                 console.log(`    ${msg}`),
               );
               console.log("");
@@ -706,6 +827,87 @@ const icStoragePlugin = {
               console.log("");
             } catch (err) {
               console.error(`  Import failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          });
+        vault
+          .command("revoke")
+          .description("Revoke Factory controller access -- make your vault fully sovereign")
+          .action(async () => {
+            try {
+              console.log("");
+              console.log("  IC Sovereign Persistent Memory -- Revoke Factory Controller");
+              console.log("  -----------------------------------------------------------");
+              console.log("");
+              console.log("  This removes the Factory canister as a controller of your vault.");
+              console.log("  After this, ONLY your identity can control (upgrade, delete) your vault.");
+              console.log("");
+              console.log("  WARNING: This is irreversible. The Factory will no longer be able to");
+              console.log("  assist with vault recovery or upgrades.");
+              console.log("");
+
+              const result = await getClient().revokeFactoryController();
+              if ("ok" in result) {
+                console.log("  Factory controller access revoked successfully.");
+                console.log("  Your vault is now fully sovereign -- only you control it.");
+                console.log("");
+              } else {
+                console.error(`  Revoke failed: ${result.err}`);
+                console.error("");
+              }
+            } catch (err) {
+              console.error(`  Revoke failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          });
+
+        vault
+          .command("delete-identity")
+          .description("Delete your IC identity from this device (DESTRUCTIVE)")
+          .action(async () => {
+            try {
+              console.log("");
+              console.log("  IC Sovereign Persistent Memory -- Delete Identity");
+              console.log("  -------------------------------------------------");
+              console.log("");
+              console.log("  WARNING: This will permanently delete your IC identity from this device.");
+              console.log("  If you have not exported your identity key, you will LOSE ACCESS to your vault.");
+              console.log("  There is no recovery without the identity key.");
+              console.log("");
+
+              if (!identityExists()) {
+                console.log("  No identity found on this device. Nothing to delete.");
+                console.log("");
+                return;
+              }
+
+              // Read confirmation from stdin
+              const readline = await import("node:readline");
+              const rl = readline.createInterface({
+                input: process.stdin,
+                output: process.stdout,
+              });
+
+              const answer = await new Promise<string>((resolve) => {
+                rl.question("  Type 'DELETE' to confirm: ", (ans) => {
+                  rl.close();
+                  resolve(ans);
+                });
+              });
+
+              if (answer.trim() !== "DELETE") {
+                console.log("");
+                console.log("  Aborted. Identity was NOT deleted.");
+                console.log("");
+                return;
+              }
+
+              deleteIdentity();
+              console.log("");
+              console.log("  Identity deleted from this device.");
+              console.log("  If you exported your key previously, you can re-import it with:");
+              console.log("    openclaw ic-memory import-identity");
+              console.log("");
+            } catch (err) {
+              console.error(`  Delete failed: ${err instanceof Error ? err.message : String(err)}`);
             }
           });
       },

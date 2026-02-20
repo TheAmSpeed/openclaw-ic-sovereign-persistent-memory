@@ -1,6 +1,6 @@
 {
   "name": "openclaw-ic-sovereign-persistent-memory",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "description": "Sovereign, persistent AI memory on the Internet Computer. Your memories live in a personal canister that only you control -- across devices, forever.",
   "type": "module",
   "main": "./index.ts",
@@ -9,6 +9,7 @@
     "config.ts",
     "ic-client.ts",
     "identity.ts",
+    "memory-reader.ts",
     "prompts.ts",
     "sync.ts",
     "openclaw.plugin.json",

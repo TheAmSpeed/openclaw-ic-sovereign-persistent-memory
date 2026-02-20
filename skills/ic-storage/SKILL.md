@@ -52,11 +52,13 @@ The setup command prints the exact command to run.
 ```bash
 openclaw ic-memory setup            # Generate identity + create vault
 openclaw ic-memory status           # Show vault stats (memories, sessions, cycles)
-openclaw ic-memory sync             # Manual sync to IC
+openclaw ic-memory sync             # Sync local memory files to IC vault
 openclaw ic-memory restore          # Restore all data from IC to local
 openclaw ic-memory audit            # Show immutable audit log
 openclaw ic-memory export-identity  # Export identity key for cross-device use
 openclaw ic-memory import-identity  # Import identity from another device (reads from stdin)
+openclaw ic-memory revoke           # Revoke Factory controller (full sovereignty)
+openclaw ic-memory delete-identity  # Delete identity from this device (destructive)
 ```
 
 ### Agent Tools
@@ -73,11 +75,15 @@ Note: Deletion is available via the canister API for advanced users but is inten
 
 ## How It Works
 
-1. OpenClaw creates memories about you and your projects during conversations (preferences, decisions, project context).
-2. This plugin replaces the built-in memory storage -- instead of saving locally, memories go to your IC vault canister.
-3. Each sync uses differential comparison via a SyncManifest -- only changed entries are uploaded.
-4. The vault canister uses Enhanced Orthogonal Persistence (EOP) for automatic data persistence across canister upgrades.
-5. Every write goes through IC consensus (replicated across multiple nodes), making the audit log tamper-proof.
+1. **Smart Recall (before every conversation)**: When you start talking, the plugin analyzes your prompt, searches your IC vault for relevant memories (by category and keyword), and injects them as context before the agent starts thinking. The agent now remembers your preferences, decisions, and project context across sessions and devices.
+
+2. **Auto-Capture (after every conversation)**: When a conversation ends, the plugin reads your local memory files (`MEMORY.md`, `memory/*.md`) and extracts memory-worthy content from conversation messages. Everything is synced to your IC vault automatically.
+
+3. **Compaction Protection (before context compaction)**: Before OpenClaw compacts your context window (which can destroy unwritten memories), the plugin saves all current memories to your IC vault. This prevents the most common cause of "OpenClaw forgot something."
+
+4. Each sync uses differential comparison via a SyncManifest -- only changed entries are uploaded.
+5. The vault canister uses Enhanced Orthogonal Persistence (EOP) for automatic data persistence across canister upgrades.
+6. Every write goes through IC consensus (replicated across multiple nodes), making the audit log tamper-proof.
 
 ## Cross-Device Setup
 

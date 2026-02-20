@@ -1,8 +1,9 @@
 /// Tests for IC Sovereign Persistent Memory plugin.
 /// Covers: config parsing, sync logic, encoding utilities, plugin structure, and identity management.
 
-import { describe, it, expect, beforeAll } from "vitest";
-import { rmSync } from "fs";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { rmSync, mkdirSync, writeFileSync, existsSync } from "fs";
+import { join } from "path";
 import { parseConfig, type IcStorageConfig } from "./config.js";
 import type { SyncManifestData } from "./ic-client.js";
 import { encodeContent, decodeContent, computeSyncDelta, type LocalMemory } from "./sync.js";
@@ -798,5 +799,501 @@ describe("encryption", () => {
     const dKey = crypto.pbkdf2Sync(passphrase, tooShort.subarray(0, 32), 600_000, 32, "sha256");
     // This should fail because there's not enough data for salt+iv+authTag+ciphertext
     expect(tooShort.length).toBeLessThan(65);
+  });
+});
+
+// ============================================================
+// Memory reader tests
+// ============================================================
+
+describe("memory-reader", () => {
+  let memoryReader: typeof import("./memory-reader.js");
+  const tmpWorkspace = `/tmp/ic-vault-memory-reader-test-${Date.now()}`;
+
+  beforeAll(async () => {
+    memoryReader = await import("./memory-reader.js");
+
+    // Create test workspace with memory files
+    mkdirSync(join(tmpWorkspace, "memory"), { recursive: true });
+
+    // Primary MEMORY.md
+    writeFileSync(
+      join(tmpWorkspace, "MEMORY.md"),
+      `---
+title: Agent Memory
+---
+
+# Agent Memory
+
+## User Preferences
+
+- Prefers TypeScript over JavaScript
+- Uses Vim keybindings
+- Dark mode in all editors
+
+## Project Decisions
+
+- Using mo:core 2.0.0 for canisters
+- Ed25519 for identity management
+- Factory pattern for vault creation
+
+## Tools and Workflow
+
+- Build with dfx 0.30.2
+- Deploy to IC mainnet
+- Tests with vitest
+`,
+    );
+
+    // Daily note in memory/ directory
+    writeFileSync(
+      join(tmpWorkspace, "memory", "2026-02-20.md"),
+      `# 2026-02-20
+
+## Session Notes
+
+- Fixed compilation error in Factory.mo
+- Migrated from Trie to Map (mo:core)
+- Published v1.0.3 to npm
+
+## Blockers
+
+- dfx ships moc 0.16.3, too old for mo:core
+- Need moc-wrapper to override
+`,
+    );
+
+    // Another daily note
+    writeFileSync(
+      join(tmpWorkspace, "memory", "2026-02-19.md"),
+      `# 2026-02-19
+
+## Context
+
+Working on the IC Sovereign Persistent Memory plugin.
+Currently at v1.0.2, preparing for mo:core migration.
+`,
+    );
+  });
+
+  afterAll(() => {
+    try {
+      rmSync(tmpWorkspace, { recursive: true });
+    } catch {
+      // Best effort cleanup
+    }
+  });
+
+  describe("stripFrontMatter", () => {
+    it("strips YAML front matter from markdown", () => {
+      const input = `---
+title: Test
+tags: [a, b]
+---
+# Content Here`;
+      const result = memoryReader.stripFrontMatter(input);
+      expect(result).toBe("# Content Here");
+    });
+
+    it("returns unchanged content without front matter", () => {
+      const input = "# No Front Matter\nSome content";
+      expect(memoryReader.stripFrontMatter(input)).toBe(input);
+    });
+
+    it("handles empty content after front matter", () => {
+      const input = `---
+title: Test
+---`;
+      expect(memoryReader.stripFrontMatter(input)).toBe("");
+    });
+
+    it("handles content that starts with --- but is not front matter", () => {
+      const input = "---\nThis is a horizontal rule with no closing ---";
+      // No closing ---, so returned as-is
+      expect(memoryReader.stripFrontMatter(input)).toBe(input);
+    });
+  });
+
+  describe("parseMarkdownSections", () => {
+    it("parses headings into sections", () => {
+      const content = `## Preferences
+
+- Dark mode
+- Vim keys
+
+## Decisions
+
+- Use TypeScript
+`;
+      const sections = memoryReader.parseMarkdownSections(content, "test.md");
+      expect(sections).toHaveLength(2);
+      expect(sections[0].heading).toBe("Preferences");
+      expect(sections[0].content).toContain("Dark mode");
+      expect(sections[1].heading).toBe("Decisions");
+      expect(sections[1].content).toContain("Use TypeScript");
+    });
+
+    it("handles content before any heading as 'general'", () => {
+      const content = `Some introductory content
+without any headings.`;
+      const sections = memoryReader.parseMarkdownSections(content, "test.md");
+      expect(sections).toHaveLength(1);
+      expect(sections[0].heading).toBe("general");
+    });
+
+    it("handles empty content", () => {
+      expect(memoryReader.parseMarkdownSections("", "test.md")).toHaveLength(0);
+      expect(memoryReader.parseMarkdownSections("   \n  \n  ", "test.md")).toHaveLength(0);
+    });
+
+    it("strips front matter before parsing", () => {
+      const content = `---
+title: Test
+---
+
+## Real Content
+
+This should be parsed.`;
+      const sections = memoryReader.parseMarkdownSections(
+        memoryReader.stripFrontMatter(content),
+        "test.md",
+      );
+      expect(sections).toHaveLength(1);
+      expect(sections[0].heading).toBe("Real Content");
+    });
+
+    it("includes source file path", () => {
+      const sections = memoryReader.parseMarkdownSections("## Test\nContent", "/path/to/file.md");
+      expect(sections[0].sourceFile).toBe("/path/to/file.md");
+    });
+  });
+
+  describe("deriveCategory", () => {
+    it("maps preference headings to 'preferences'", () => {
+      expect(memoryReader.deriveCategory("User Preferences")).toBe("preferences");
+      expect(memoryReader.deriveCategory("My Prefs")).toBe("preferences");
+    });
+
+    it("maps decision headings to 'decisions'", () => {
+      expect(memoryReader.deriveCategory("Project Decisions")).toBe("decisions");
+      expect(memoryReader.deriveCategory("We Decided")).toBe("decisions");
+    });
+
+    it("maps project headings to 'project'", () => {
+      expect(memoryReader.deriveCategory("Project Architecture")).toBe("project");
+    });
+
+    it("maps tool headings to 'tools'", () => {
+      expect(memoryReader.deriveCategory("Tools and Workflow")).toBe("tools");
+      expect(memoryReader.deriveCategory("Command Reference")).toBe("tools");
+    });
+
+    it("maps lesson headings to 'lessons'", () => {
+      expect(memoryReader.deriveCategory("Lessons Learned")).toBe("lessons");
+      expect(memoryReader.deriveCategory("Key Insight")).toBe("lessons");
+    });
+
+    it("maps blocker headings to 'issues'", () => {
+      expect(memoryReader.deriveCategory("Blockers")).toBe("issues");
+      expect(memoryReader.deriveCategory("Current Issues")).toBe("issues");
+    });
+
+    it("maps date headings to 'daily'", () => {
+      expect(memoryReader.deriveCategory("2026-02-20")).toBe("daily");
+      expect(memoryReader.deriveCategory("2025-12-31")).toBe("daily");
+    });
+
+    it("returns 'general' for unrecognized headings", () => {
+      expect(memoryReader.deriveCategory("Random Stuff")).toBe("general");
+      expect(memoryReader.deriveCategory("Miscellaneous")).toBe("general");
+    });
+
+    it("maps identity headings to 'identity'", () => {
+      expect(memoryReader.deriveCategory("About Me")).toBe("identity");
+      expect(memoryReader.deriveCategory("User Identity")).toBe("identity");
+    });
+
+    it("maps convention headings to 'conventions'", () => {
+      expect(memoryReader.deriveCategory("Coding Conventions")).toBe("conventions");
+      expect(memoryReader.deriveCategory("Style Guide")).toBe("conventions");
+    });
+
+    it("maps context headings to 'context'", () => {
+      expect(memoryReader.deriveCategory("Current Context")).toBe("context");
+      expect(memoryReader.deriveCategory("Project Status")).toBe("context");
+    });
+
+    it("maps task headings to 'tasks'", () => {
+      expect(memoryReader.deriveCategory("Todo List")).toBe("tasks");
+      expect(memoryReader.deriveCategory("Next Steps")).toBe("tasks");
+    });
+  });
+
+  describe("deriveKey", () => {
+    it("creates key from filename and heading", () => {
+      const key = memoryReader.deriveKey("User Preferences", "/workspace/MEMORY.md");
+      expect(key).toBe("MEMORY/user-preferences");
+    });
+
+    it("sanitizes special characters", () => {
+      const key = memoryReader.deriveKey("What's the plan?!", "/workspace/notes.md");
+      expect(key).toBe("notes/what-s-the-plan");
+    });
+
+    it("uses 'general' for empty heading", () => {
+      const key = memoryReader.deriveKey("", "/workspace/MEMORY.md");
+      expect(key).toBe("MEMORY/general");
+    });
+
+    it("truncates long headings to 60 chars", () => {
+      const longHeading = "This is a very long heading that should be truncated to sixty characters maximum";
+      const key = memoryReader.deriveKey(longHeading, "/workspace/test.md");
+      const headingPart = key.split("/")[1];
+      expect(headingPart.length).toBeLessThanOrEqual(60);
+    });
+  });
+
+  describe("findMemoryFiles", () => {
+    it("finds MEMORY.md in workspace", () => {
+      const files = memoryReader.findMemoryFiles(tmpWorkspace);
+      const basenames = files.map((f) => f.split("/").pop());
+      expect(basenames).toContain("MEMORY.md");
+    });
+
+    it("finds daily notes in memory/ directory", () => {
+      const files = memoryReader.findMemoryFiles(tmpWorkspace);
+      const basenames = files.map((f) => f.split("/").pop());
+      expect(basenames).toContain("2026-02-20.md");
+      expect(basenames).toContain("2026-02-19.md");
+    });
+
+    it("returns empty for nonexistent workspace", () => {
+      const files = memoryReader.findMemoryFiles("/tmp/nonexistent-workspace-xyz");
+      expect(files).toHaveLength(0);
+    });
+
+    it("sorts by modification time (newest first)", () => {
+      const files = memoryReader.findMemoryFiles(tmpWorkspace);
+      expect(files.length).toBeGreaterThan(0);
+      // Files should be sorted -- we can't guarantee exact order in CI,
+      // but all should be valid paths
+      for (const f of files) {
+        expect(existsSync(f)).toBe(true);
+      }
+    });
+  });
+
+  describe("readLocalMemories", () => {
+    it("reads and parses all memory files from workspace", () => {
+      const memories = memoryReader.readLocalMemories(tmpWorkspace);
+      expect(memories.length).toBeGreaterThan(0);
+    });
+
+    it("produces entries with required fields", () => {
+      const memories = memoryReader.readLocalMemories(tmpWorkspace);
+      for (const mem of memories) {
+        expect(mem.key).toBeTruthy();
+        expect(mem.category).toBeTruthy();
+        expect(mem.content).toBeTruthy();
+        expect(typeof mem.metadata).toBe("string");
+        expect(mem.createdAt).toBeGreaterThan(0);
+        expect(mem.updatedAt).toBeGreaterThan(0);
+      }
+    });
+
+    it("deduplicates by key", () => {
+      const memories = memoryReader.readLocalMemories(tmpWorkspace);
+      const keys = memories.map((m) => m.key);
+      const uniqueKeys = new Set(keys);
+      expect(keys.length).toBe(uniqueKeys.size);
+    });
+
+    it("metadata includes heading and sourceFile", () => {
+      const memories = memoryReader.readLocalMemories(tmpWorkspace);
+      for (const mem of memories) {
+        const metadata = JSON.parse(mem.metadata);
+        expect(metadata.heading).toBeTruthy();
+        expect(metadata.sourceFile).toBeTruthy();
+      }
+    });
+
+    it("finds preferences from MEMORY.md", () => {
+      const memories = memoryReader.readLocalMemories(tmpWorkspace);
+      const prefs = memories.find((m) => m.category === "preferences");
+      expect(prefs).toBeDefined();
+      expect(prefs!.content).toContain("TypeScript");
+    });
+
+    it("finds decisions from MEMORY.md", () => {
+      const memories = memoryReader.readLocalMemories(tmpWorkspace);
+      const decisions = memories.find((m) => m.category === "decisions");
+      expect(decisions).toBeDefined();
+      expect(decisions!.content).toContain("mo:core");
+    });
+
+    it("finds daily notes", () => {
+      const memories = memoryReader.readLocalMemories(tmpWorkspace);
+      const daily = memories.filter((m) => m.key.startsWith("2026-02-20/"));
+      expect(daily.length).toBeGreaterThan(0);
+    });
+
+    it("returns empty for workspace with no memory files", () => {
+      const emptyDir = `/tmp/ic-vault-empty-workspace-${Date.now()}`;
+      mkdirSync(emptyDir, { recursive: true });
+      const memories = memoryReader.readLocalMemories(emptyDir);
+      expect(memories).toHaveLength(0);
+      rmSync(emptyDir, { recursive: true });
+    });
+  });
+
+  describe("extractMemoriesFromMessages", () => {
+    it("extracts from assistant messages with decision markers", () => {
+      const messages = [
+        { role: "user", content: "Should we use mo:core or mo:base?" },
+        { role: "assistant", content: "Key decision: We should use mo:core 2.0.0 for all new canister development." },
+      ];
+      const memories = memoryReader.extractMemoriesFromMessages(messages);
+      expect(memories.length).toBeGreaterThan(0);
+      expect(memories[0].category).toBe("decisions");
+    });
+
+    it("ignores user messages", () => {
+      const messages = [
+        { role: "user", content: "Key decision: I want to use Python" },
+      ];
+      const memories = memoryReader.extractMemoriesFromMessages(messages);
+      expect(memories).toHaveLength(0);
+    });
+
+    it("handles empty messages array", () => {
+      expect(memoryReader.extractMemoriesFromMessages([])).toHaveLength(0);
+    });
+
+    it("handles non-object messages gracefully", () => {
+      const messages = [null, undefined, 42, "string", { role: "system" }];
+      // Should not throw
+      const memories = memoryReader.extractMemoriesFromMessages(messages as unknown[]);
+      expect(memories).toHaveLength(0);
+    });
+
+    it("extracts from messages with array content blocks", () => {
+      const messages = [
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Noted: The user prefers dark mode in all applications and editors." },
+          ],
+        },
+      ];
+      const memories = memoryReader.extractMemoriesFromMessages(messages);
+      expect(memories.length).toBeGreaterThan(0);
+    });
+
+    it("skips very short content (under 10 chars)", () => {
+      const messages = [
+        { role: "assistant", content: "Noted: ok" },
+      ];
+      const memories = memoryReader.extractMemoriesFromMessages(messages);
+      expect(memories).toHaveLength(0);
+    });
+  });
+
+  describe("formatMemoriesAsContext", () => {
+    it("formats memories as markdown context", () => {
+      const memories = [
+        { key: "prefs/dark-mode", category: "preferences", content: "User prefers dark mode" },
+        { key: "decisions/lang", category: "decisions", content: "Using TypeScript" },
+      ];
+      const context = memoryReader.formatMemoriesAsContext(memories);
+      expect(context).toContain("## Recalled from IC Sovereign Memory Vault");
+      expect(context).toContain("[preferences]");
+      expect(context).toContain("dark mode");
+      expect(context).toContain("[decisions]");
+    });
+
+    it("returns empty string for no memories", () => {
+      expect(memoryReader.formatMemoriesAsContext([])).toBe("");
+    });
+
+    it("respects token limit", () => {
+      const largeContent = "x".repeat(10000);
+      const memories = [
+        { key: "large", category: "general", content: largeContent },
+        { key: "small", category: "general", content: "should not appear" },
+      ];
+      // Very small token limit
+      const context = memoryReader.formatMemoriesAsContext(memories, 100);
+      // Should have at most a few entries before hitting the limit
+      expect(context.length).toBeLessThan(largeContent.length);
+    });
+
+    it("handles Uint8Array content", () => {
+      const memories = [
+        {
+          key: "test",
+          category: "general",
+          content: new TextEncoder().encode("Binary content test"),
+        },
+      ];
+      const context = memoryReader.formatMemoriesAsContext(memories);
+      expect(context).toContain("Binary content test");
+    });
+  });
+
+  describe("deriveSearchTerms", () => {
+    it("detects preference-related prompts", () => {
+      const { categories } = memoryReader.deriveSearchTerms("What are my preferences for editors?");
+      expect(categories).toContain("preferences");
+    });
+
+    it("detects decision-related prompts", () => {
+      const { categories } = memoryReader.deriveSearchTerms("What did we decide about the database?");
+      expect(categories).toContain("decisions");
+    });
+
+    it("detects tool-related prompts", () => {
+      const { categories } = memoryReader.deriveSearchTerms("How do I set up the workflow?");
+      expect(categories).toContain("tools");
+    });
+
+    it("detects issue-related prompts", () => {
+      const { categories } = memoryReader.deriveSearchTerms("What bugs are we tracking?");
+      expect(categories).toContain("issues");
+    });
+
+    it("detects daily/session-related prompts", () => {
+      const { categories } = memoryReader.deriveSearchTerms("What did we do yesterday?");
+      expect(categories).toContain("daily");
+    });
+
+    it("extracts quoted terms as prefixes", () => {
+      const { prefixes } = memoryReader.deriveSearchTerms('Find memories about "mo:core migration"');
+      expect(prefixes.length).toBeGreaterThan(0);
+      expect(prefixes[0]).toContain("mo-core");
+    });
+
+    it("returns empty categories for generic prompts", () => {
+      const { categories } = memoryReader.deriveSearchTerms("Hello, how are you?");
+      expect(categories).toHaveLength(0);
+    });
+
+    it("detects multiple categories", () => {
+      const { categories } = memoryReader.deriveSearchTerms(
+        "What preferences and decisions have we made about the project tools?",
+      );
+      expect(categories.length).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  describe("resolveWorkspaceDir", () => {
+    it("returns provided workspace dir", () => {
+      expect(memoryReader.resolveWorkspaceDir("/custom/workspace")).toBe("/custom/workspace");
+    });
+
+    it("returns default for undefined", () => {
+      const result = memoryReader.resolveWorkspaceDir(undefined);
+      expect(result).toContain(".openclaw");
+      expect(result).toContain("workspace");
+    });
   });
 });

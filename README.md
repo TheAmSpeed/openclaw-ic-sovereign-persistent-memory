@@ -29,16 +29,18 @@ OpenClaw stores your AI memories locally. That's great for privacy and speed. Bu
 - **Multiple machines?** Memories fragmented.
 - **Disk failure?** Memories gone.
 
-This plugin gives you persistent, sovereign backup:
+This plugin gives you persistent, sovereign backup -- and solves the three common ways OpenClaw memory fails:
 
 | Feature | How it works |
 |---|---|
+| **Smart Memory Recall** | Before every conversation, relevant memories are automatically loaded from your IC vault and injected as context. The agent remembers across sessions and devices without you asking. |
+| **Auto-Capture** | Memories from local files (`MEMORY.md`, `memory/*.md`) and conversations are automatically synced to your IC vault. No manual steps. |
+| **Compaction-Proof** | Before context compaction can destroy memories, they're saved to your IC vault. Compaction can no longer cause memory loss. |
 | **Sovereign ownership** | Your vault is a personal canister. Only your Ed25519 identity principal can read or write it. Not even the factory deployer has access. |
 | **Differential sync** | Only changed entries are uploaded. Sync is fast and bandwidth-efficient. |
 | **Cross-device restore** | Run `openclaw ic-memory restore` on any device to pull all your memories down. |
 | **Immutable audit log** | Every operation is recorded with IC consensus-verified timestamps. The log is append-only and tamper-proof. |
 | **No seed phrases** | Authentication uses an Ed25519 key pair stored in your OS keychain (macOS Keychain / Linux Secret Service). No browser, no passwords to remember. |
-| **Auto-sync** | Memories sync automatically when conversations end. No manual steps required. |
 
 ## Architecture
 
@@ -79,11 +81,13 @@ Local Device                          Internet Computer (IC)
 ```bash
 openclaw ic-memory setup            # Generate identity + create vault
 openclaw ic-memory status           # Show vault stats (memories, sessions, cycles)
-openclaw ic-memory sync             # Manual sync to IC
+openclaw ic-memory sync             # Sync local memory files to IC vault
 openclaw ic-memory restore          # Restore all data from IC to local
 openclaw ic-memory audit            # Show immutable audit log
 openclaw ic-memory export-identity  # Export identity for cross-device use
 openclaw ic-memory import-identity  # Import identity from another device (stdin)
+openclaw ic-memory revoke           # Revoke Factory controller (full sovereignty)
+openclaw ic-memory delete-identity  # Delete identity from this device (destructive)
 ```
 
 ### Agent Tools
@@ -197,9 +201,10 @@ index.ts              Plugin entry point (tools, hooks, CLI, service)
 config.ts             Config types and parser
 ic-client.ts          @dfinity/agent wrapper (identity loading, canister calls)
 identity.ts           Ed25519 identity management (keychain, encrypted file, import/export)
+memory-reader.ts      Local memory file reader/parser (MEMORY.md, memory/*.md)
 sync.ts               Differential sync engine
 prompts.ts            Smart adoption messaging
-index.test.ts         Test suite (73 tests)
+index.test.ts         Test suite (130 tests)
 e2e-test.ts           End-to-end test against IC mainnet (13 tests)
 openclaw.plugin.json  Plugin manifest
 skills/ic-storage/    Bundled skill (SKILL.md)
@@ -208,9 +213,10 @@ canister/             Motoko canister source (Factory + UserVault)
 
 ## Known Limitations
 
-- Auto-sync hooks (`session_end`, `agent_end`) are wired and trigger a manifest check. Full `MemorySearchManager` integration (auto-pulling local memories for sync) is planned for v1.1. Manual sync via `vault_sync` tool or `openclaw ic-memory sync` works now.
+- Memory extraction from conversation messages uses pattern matching on known markers (e.g. "Key decision:", "Noted:", "Preference:"). Memories without these patterns are still captured from local memory files (`MEMORY.md`, `memory/*.md`).
 - The `vault_delete` agent tool is intentionally omitted. Deletion is available via the canister API for advanced users, but the agent encourages an append-friendly workflow.
 - Audit log entries are capped at 100,000 with FIFO eviction of the oldest 10% when full.
+- Smart recall searches by category/prefix matching against the user's prompt. Very short or ambiguous prompts may not trigger targeted recall (a broad recall of recent memories is used as fallback).
 
 ## License
 
