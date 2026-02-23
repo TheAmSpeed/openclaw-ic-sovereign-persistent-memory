@@ -986,6 +986,22 @@ const icStoragePlugin = {
               }
 
               const ic = getClient();
+
+              // Check vault version supports encryption
+              let supportsEncryption = false;
+              try {
+                const versionInfo = await ic.getVaultVersion();
+                supportsEncryption = versionInfo.supportsEncryption;
+              } catch {
+                // v1 vault doesn't have getVaultVersion
+              }
+              if (!supportsEncryption) {
+                console.error("  Your vault does not support encryption (v1).");
+                console.error("  Run `openclaw ic-memory upgrade-vault` first to upgrade to v2.");
+                console.log("");
+                return;
+              }
+
               const dashboard = await ic.getDashboard();
               const totalMemories = Number(dashboard.stats.totalMemories);
 
@@ -1074,7 +1090,9 @@ const icStoragePlugin = {
                     content: encrypted,
                     metadata: entry.metadata,
                     createdAt: entry.createdAt,
-                    updatedAt: entry.updatedAt,
+                    // Bump updatedAt by 1 nanosecond so bulkSync accepts the update.
+                    // bulkSync uses strict > comparison, so same timestamp = skip.
+                    updatedAt: entry.updatedAt + 1n,
                     isEncrypted: true,
                   });
                 }

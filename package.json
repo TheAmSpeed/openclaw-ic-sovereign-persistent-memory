@@ -1,6 +1,6 @@
 {
   "name": "openclaw-ic-sovereign-persistent-memory",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Sovereign, persistent AI memory on the Internet Computer. Your memories live in a personal canister that only you control -- across devices, forever.",
   "type": "module",
   "main": "./index.ts",
