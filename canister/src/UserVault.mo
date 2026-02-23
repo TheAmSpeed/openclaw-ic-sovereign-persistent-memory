@@ -9,11 +9,70 @@ import Text "mo:core/Text";
 import Time "mo:core/Time";
 import Cycles "mo:core/Cycles";
 import Principal "mo:core/Principal";
+import Error "mo:core/Error";
+import VetKeys "mo:ic-vetkeys";
 
 /// Per-user persistent vault canister.
 /// Uses Map (mutable B-tree, order 32) for key-value lookups.
 /// Uses List (Brodnik resizable array) for the audit log -- amortized O(1) append, O(1) random access.
 /// All vars persist across upgrades via Enhanced Orthogonal Persistence.
+///
+/// EOP Migration (v1 → v2):
+/// Transforms memories Map values from MemoryEntryV1 (no isEncrypted field) to
+/// MemoryEntry (with isEncrypted = false). Only the `memories` field is consumed
+/// and produced — all other stable fields transfer automatically.
+/// This function runs ONLY during upgrades, not fresh installs.
+(with migration =
+  func (old : {
+    var memories : Map.Map<Text, Types.MemoryEntryV1>;
+    // auditLog with v1 AuditAction (without #upgrade).
+    // Must be consumed to widen the variant type.
+    var auditLog : List.List<{
+      timestamp : Int;
+      action : { #store; #delete; #bulkSync; #restore; #created; #accessDenied };
+      caller : Principal;
+      key : ?Text;
+      category : ?Text;
+      details : ?Text;
+    }>;
+  })
+    : {
+      var memories : Map.Map<Text, Types.MemoryEntry>;
+      var auditLog : List.List<Types.AuditEntry>;
+    } {
+      // Migrate memories: add isEncrypted = false to every entry
+      let newMemories = Map.map<Text, Types.MemoryEntryV1, Types.MemoryEntry>(
+        old.memories,
+        func (_key, entry) : Types.MemoryEntry = {
+          key = entry.key;
+          category = entry.category;
+          content = entry.content;
+          metadata = entry.metadata;
+          createdAt = entry.createdAt;
+          updatedAt = entry.updatedAt;
+          isEncrypted = false;
+        },
+      );
+
+      // Migrate auditLog: widen AuditAction variant to include #upgrade
+      let newLog = List.empty<Types.AuditEntry>();
+      for (entry in List.values(old.auditLog)) {
+        List.add(newLog, {
+          timestamp = entry.timestamp;
+          action = entry.action; // Motoko widens the variant automatically
+          caller = entry.caller;
+          key = entry.key;
+          category = entry.category;
+          details = entry.details;
+        });
+      };
+
+      {
+        var memories = newMemories;
+        var auditLog = newLog;
+      }
+    }
+)
 persistent actor class UserVault(initOwner : Principal) {
 
   // -- Constants --
@@ -27,6 +86,21 @@ persistent actor class UserVault(initOwner : Principal) {
 
   /// Maximum audit log entries before FIFO eviction
   let MAX_AUDIT_LOG_SIZE : Nat = 100_000;
+
+  /// Vault schema version (incremented on breaking changes)
+  let VAULT_VERSION : Nat = 2;
+
+  /// vetKey configuration: key ID for the IC VetKD system.
+  /// Use "test_key_1" for development (cheaper, 13-node subnet).
+  /// Use "key_1" for production (34-node high-replication subnet).
+  let vetKdKeyId : VetKeys.ManagementCanister.VetKdKeyid = {
+    curve = #bls12_381_g2;
+    name = "test_key_1";
+  };
+
+  /// Domain separator for vetKey derivation — unique to this application.
+  /// Used as the `context` parameter in vetkd_derive_key / vetkd_public_key.
+  let vetKeyContext : Blob = Text.encodeUtf8("openclaw-ic-sovereign-memory-v1");
 
   // -- State --
   // All vars implicitly stable (EOP). Map and List are stable types.
@@ -232,6 +306,7 @@ persistent actor class UserVault(initOwner : Principal) {
     category : Text,
     content : Blob,
     metadata : Text,
+    isEncrypted : Bool,
   ) : async Result.Result<(), Types.VaultError> {
     if (not assertOwner(caller)) {
       return #err(#unauthorized);
@@ -260,6 +335,7 @@ persistent actor class UserVault(initOwner : Principal) {
       metadata = metadata;
       createdAt = createdAt;
       updatedAt = now;
+      isEncrypted = isEncrypted;
     };
 
     // Map.add replaces existing key if present. Use Map.take to get old value first.
@@ -398,6 +474,7 @@ persistent actor class UserVault(initOwner : Principal) {
                 metadata = input.metadata;
                 createdAt = input.createdAt;
                 updatedAt = input.updatedAt;
+                isEncrypted = input.isEncrypted;
               };
 
               let old = Map.take(memories, Text.compare, input.key);
@@ -593,6 +670,66 @@ persistent actor class UserVault(initOwner : Principal) {
     });
 
     #ok(());
+  };
+
+  // -- VETKEY ENDPOINTS (update calls — require consensus for security) --
+  // These proxy the IC management canister's VetKD API.
+  // The canister NEVER decrypts data — it only facilitates key derivation.
+
+  /// Get an encrypted vetKey for the caller. The caller provides a transport public key
+  /// (from a fresh TransportSecretKey), and the IC returns the vetKey encrypted under
+  /// that transport key. Only the caller can decrypt it with their transport secret key.
+  /// This is an UPDATE call (not query) to ensure consensus verification.
+  public shared ({ caller }) func getEncryptedVetkey(
+    transportPublicKey : Blob,
+  ) : async Result.Result<Blob, Types.VaultError> {
+    if (not assertOwner(caller)) {
+      return #err(#unauthorized);
+    };
+    if (transportPublicKey.size() != 48) {
+      return #err(#invalidInput("transport public key must be exactly 48 bytes (BLS12-381 G1 point)"));
+    };
+
+    try {
+      let encryptedKey = await VetKeys.ManagementCanister.vetKdDeriveKey(
+        Principal.toBlob(caller),  // input: owner's principal as derivation input
+        vetKeyContext,             // context: application domain separator
+        vetKdKeyId,                // key_id: which master key to use
+        transportPublicKey,        // transport_public_key: ephemeral encryption key
+      );
+      #ok(encryptedKey);
+    } catch (e) {
+      #err(#vetKeyError("vetkd_derive_key failed: " # debug_show (Error.code(e)) # " " # Error.message(e)));
+    };
+  };
+
+  /// Get the vetKey verification key (public key) for this canister + context.
+  /// Used by the client to verify decrypted vetKeys. This is an UPDATE call
+  /// for consistency (could be a query, but update ensures consensus verification).
+  public shared ({ caller }) func getVetkeyVerificationKey() : async Result.Result<Blob, Types.VaultError> {
+    if (not assertOwner(caller)) {
+      return #err(#unauthorized);
+    };
+
+    try {
+      let publicKey = await VetKeys.ManagementCanister.vetKdPublicKey(
+        null,            // canister_id: null = this canister
+        vetKeyContext,   // context: application domain separator
+        vetKdKeyId,      // key_id: which master key
+      );
+      #ok(publicKey);
+    } catch (e) {
+      #err(#vetKeyError("vetkd_public_key failed: " # debug_show (Error.code(e)) # " " # Error.message(e)));
+    };
+  };
+
+  /// Get vault version info for upgrade coordination.
+  public query ({ caller }) func getVaultVersion() : async Result.Result<Types.VaultVersion, Types.VaultError> {
+    if (caller != owner) { return #err(#unauthorized) };
+    #ok({
+      version = VAULT_VERSION;
+      supportsEncryption = true;
+    });
   };
 
   // -- QUERY CALLS (free, no consensus needed) --

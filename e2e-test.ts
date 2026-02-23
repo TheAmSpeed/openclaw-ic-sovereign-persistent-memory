@@ -162,6 +162,9 @@ async function main() {
 
   // -- Step 13: Verify deletion --
   log("\n--- Step 13: Verify Deletion ---");
+  // Wait briefly for the delete update to propagate to query replicas.
+  // IC query calls can hit stale replicas immediately after an update.
+  await new Promise((r) => setTimeout(r, 2000));
   const afterDelete = await client.recall(testKey);
   if (afterDelete !== null) fail("memory still exists after deletion");
   pass("Memory confirmed deleted");

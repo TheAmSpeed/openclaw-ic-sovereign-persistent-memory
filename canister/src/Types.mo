@@ -12,6 +12,7 @@ module Types {
     #restore;      // data restored from vault
     #created;      // vault created
     #accessDenied; // unauthorized access attempt
+    #upgrade;      // vault WASM upgraded to a new version
   };
 
   /// Immutable record of a vault operation.
@@ -27,7 +28,21 @@ module Types {
 
   // -- Memory --
 
-  /// A single memory entry stored in the vault
+  /// V1 memory entry type — used by the EOP migration function to read old state.
+  /// DO NOT modify this type — it must match the deployed v1.x canister's MemoryEntry exactly.
+  public type MemoryEntryV1 = {
+    key : Text;
+    category : Text;
+    content : Blob;
+    metadata : Text;
+    createdAt : Int;
+    updatedAt : Int;
+  };
+
+  /// A single memory entry stored in the vault (v2).
+  /// When isEncrypted is true, `content` holds AES-256-GCM ciphertext
+  /// (format: [8-byte header "IC GCMv2"] [12-byte nonce] [ciphertext + 16-byte tag]).
+  /// The canister never decrypts — all encryption/decryption happens client-side via vetKeys.
   public type MemoryEntry = {
     key : Text;
     category : Text;
@@ -35,6 +50,7 @@ module Types {
     metadata : Text;   // JSON string for flexible metadata
     createdAt : Int;
     updatedAt : Int;
+    isEncrypted : Bool; // true if content is AES-256-GCM ciphertext
   };
 
   // -- Sessions --
@@ -81,6 +97,13 @@ module Types {
     errors : [Text];
   };
 
+  /// Result of a bulk vault upgrade operation
+  public type UpgradeResult = {
+    succeeded : Nat;
+    failed : Nat;
+    errors : [Text];
+  };
+
   // -- Input types for bulk operations --
 
   /// Input for a single memory to store/sync
@@ -91,6 +114,7 @@ module Types {
     metadata : Text;
     createdAt : Int;
     updatedAt : Int;
+    isEncrypted : Bool; // true if content is AES-256-GCM ciphertext
   };
 
   /// Input for a session to sync
@@ -110,6 +134,8 @@ module Types {
     #unauthorized : Text;    // caller not permitted for this operation
     #notFound : Text;        // requested resource not found
     #creationFailed : Text;  // vault creation failed
+    #upgradeError : Text;    // vault upgrade failed
+    #noWasmUploaded;         // admin has not uploaded vault WASM yet
   };
 
   /// Errors returned by the vault
@@ -117,5 +143,12 @@ module Types {
     #unauthorized;
     #notFound;
     #invalidInput : Text;
+    #vetKeyError : Text;  // vetKey derivation or verification key retrieval failed
+  };
+
+  /// Vault version info for upgrade coordination
+  public type VaultVersion = {
+    version : Nat;        // incremented on schema changes
+    supportsEncryption : Bool;
   };
 };

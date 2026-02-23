@@ -447,7 +447,7 @@ export async function importIdentityFromKey(secretKeyBase64: string): Promise<Ed
     );
   }
 
-  const identity = Ed25519KeyIdentity.fromSecretKey(secretKeyBytes.buffer as ArrayBuffer);
+  const identity = Ed25519KeyIdentity.fromSecretKey(secretKeyBytes);
   const jsonStr = JSON.stringify(identity.toJSON());
   const backend = detectBackend();
 

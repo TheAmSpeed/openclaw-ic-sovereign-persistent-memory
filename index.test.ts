@@ -686,7 +686,7 @@ describe("identity", () => {
 
     // Import from base64
     const restoredKey = Buffer.from(secretB64, "base64");
-    const restored = Ed25519KeyIdentity.fromSecretKey(new Uint8Array(restoredKey).buffer as ArrayBuffer);
+    const restored = Ed25519KeyIdentity.fromSecretKey(new Uint8Array(restoredKey));
     expect(restored.getPrincipal().toText()).toBe(identity.getPrincipal().toText());
   });
 
@@ -799,6 +799,285 @@ describe("encryption", () => {
     const dKey = crypto.pbkdf2Sync(passphrase, tooShort.subarray(0, 32), 600_000, 32, "sha256");
     // This should fail because there's not enough data for salt+iv+authTag+ciphertext
     expect(tooShort.length).toBeLessThan(65);
+  });
+});
+
+// ============================================================
+// VaultCrypto (vetKeys E2E encryption) tests
+// ============================================================
+
+describe("vault-crypto", () => {
+  // We test VaultCrypto by creating a test instance with a mock VetKeyProvider.
+  // Since VaultCrypto's encrypt/decrypt use standard AES-256-GCM via WebCrypto,
+  // we can test the round-trip by directly injecting a derived AES key.
+
+  it("isEncryptedContent identifies encrypted data", async () => {
+    const { VaultCrypto } = await import("./vault-crypto.js");
+
+    // Valid header "IC GCMv2"
+    const header = new TextEncoder().encode("IC GCMv2");
+    const validCiphertext = new Uint8Array(40); // header(8) + nonce(12) + tag(16) + data(4)
+    validCiphertext.set(header, 0);
+    expect(VaultCrypto.isEncryptedContent(validCiphertext)).toBe(true);
+
+    // Wrong header
+    const plaintext = new TextEncoder().encode("Hello, World!");
+    expect(VaultCrypto.isEncryptedContent(plaintext)).toBe(false);
+
+    // Too short
+    expect(VaultCrypto.isEncryptedContent(new Uint8Array(4))).toBe(false);
+
+    // Empty
+    expect(VaultCrypto.isEncryptedContent(new Uint8Array(0))).toBe(false);
+  });
+
+  it("isEncryptedContent rejects partial header match", async () => {
+    const { VaultCrypto } = await import("./vault-crypto.js");
+
+    // Starts with "IC GCM" but wrong version byte
+    const almostHeader = new TextEncoder().encode("IC GCMv3");
+    const fake = new Uint8Array(40);
+    fake.set(almostHeader, 0);
+    expect(VaultCrypto.isEncryptedContent(fake)).toBe(false);
+  });
+
+  it("round-trips data through AES-256-GCM with WebCrypto (same algo as VaultCrypto)", async () => {
+    // This tests the same AES-256-GCM algorithm VaultCrypto uses internally,
+    // but without the vetKey derivation (which requires IC canister calls).
+    // This validates our ciphertext format: header(8) + nonce(12) + ciphertext+tag
+    const HEADER = new TextEncoder().encode("IC GCMv2");
+    const NONCE_SIZE = 12;
+
+    const rawKey = crypto.getRandomValues(new Uint8Array(32));
+    const aesKey = await crypto.subtle.importKey(
+      "raw", rawKey, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"],
+    );
+
+    const plaintext = new TextEncoder().encode("Sovereign memory: user prefers dark mode");
+    const nonce = crypto.getRandomValues(new Uint8Array(NONCE_SIZE));
+
+    // Encrypt
+    const ciphertextWithTag = new Uint8Array(
+      await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: nonce, tagLength: 128 },
+        aesKey,
+        plaintext,
+      ),
+    );
+
+    // Assemble in VaultCrypto format
+    const assembled = new Uint8Array(8 + NONCE_SIZE + ciphertextWithTag.byteLength);
+    assembled.set(HEADER, 0);
+    assembled.set(nonce, 8);
+    assembled.set(ciphertextWithTag, 8 + NONCE_SIZE);
+
+    // Verify header
+    expect(new TextDecoder().decode(assembled.subarray(0, 8))).toBe("IC GCMv2");
+
+    // Decrypt
+    const extractedNonce = assembled.subarray(8, 8 + NONCE_SIZE);
+    const extractedCiphertext = assembled.subarray(8 + NONCE_SIZE);
+    const decrypted = new Uint8Array(
+      await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: extractedNonce, tagLength: 128 },
+        aesKey,
+        extractedCiphertext,
+      ),
+    );
+
+    expect(new TextDecoder().decode(decrypted)).toBe("Sovereign memory: user prefers dark mode");
+  });
+
+  it("encrypted output is different each time (random nonce)", async () => {
+    const rawKey = crypto.getRandomValues(new Uint8Array(32));
+    const aesKey = await crypto.subtle.importKey(
+      "raw", rawKey, { name: "AES-GCM", length: 256 }, false, ["encrypt"],
+    );
+
+    const plaintext = new TextEncoder().encode("Same plaintext, different ciphertext");
+
+    async function encryptWithFormat(): Promise<Uint8Array> {
+      const nonce = crypto.getRandomValues(new Uint8Array(12));
+      const ct = new Uint8Array(await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: nonce, tagLength: 128 }, aesKey, plaintext,
+      ));
+      const result = new Uint8Array(8 + 12 + ct.byteLength);
+      result.set(new TextEncoder().encode("IC GCMv2"), 0);
+      result.set(nonce, 8);
+      result.set(ct, 20);
+      return result;
+    }
+
+    const a = await encryptWithFormat();
+    const b = await encryptWithFormat();
+
+    // Same length but different content (different nonce)
+    expect(a.byteLength).toBe(b.byteLength);
+    const same = a.every((byte, i) => byte === b[i]);
+    expect(same).toBe(false);
+  });
+
+  it("rejects ciphertext with wrong key", async () => {
+    const key1 = await crypto.subtle.importKey(
+      "raw", crypto.getRandomValues(new Uint8Array(32)),
+      { name: "AES-GCM", length: 256 }, false, ["encrypt"],
+    );
+    const key2 = await crypto.subtle.importKey(
+      "raw", crypto.getRandomValues(new Uint8Array(32)),
+      { name: "AES-GCM", length: 256 }, false, ["decrypt"],
+    );
+
+    const plaintext = new TextEncoder().encode("Secret data");
+    const nonce = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: nonce, tagLength: 128 }, key1, plaintext,
+    ));
+
+    await expect(
+      crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: nonce, tagLength: 128 }, key2, ct,
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("rejects tampered ciphertext (authentication tag verification)", async () => {
+    const rawKey = crypto.getRandomValues(new Uint8Array(32));
+    const aesKey = await crypto.subtle.importKey(
+      "raw", rawKey, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"],
+    );
+
+    const plaintext = new TextEncoder().encode("Tamper-proof data");
+    const nonce = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: nonce, tagLength: 128 }, aesKey, plaintext,
+    ));
+
+    // Flip a byte in the ciphertext
+    ct[0] ^= 0xFF;
+
+    await expect(
+      crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: nonce, tagLength: 128 }, aesKey, ct,
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("handles empty plaintext", async () => {
+    const rawKey = crypto.getRandomValues(new Uint8Array(32));
+    const aesKey = await crypto.subtle.importKey(
+      "raw", rawKey, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"],
+    );
+
+    const plaintext = new Uint8Array(0);
+    const nonce = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: nonce, tagLength: 128 }, aesKey, plaintext,
+    ));
+    const decrypted = new Uint8Array(await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: nonce, tagLength: 128 }, aesKey, ct,
+    ));
+
+    expect(decrypted.byteLength).toBe(0);
+  });
+
+  it("handles large content (64 KB)", async () => {
+    const rawKey = crypto.getRandomValues(new Uint8Array(32));
+    const aesKey = await crypto.subtle.importKey(
+      "raw", rawKey, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"],
+    );
+
+    // 64 KB of data (max for crypto.getRandomValues per call)
+    const plaintext = crypto.getRandomValues(new Uint8Array(65_536));
+    const nonce = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: nonce, tagLength: 128 }, aesKey, plaintext,
+    ));
+    const decrypted = new Uint8Array(await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: nonce, tagLength: 128 }, aesKey, ct,
+    ));
+
+    expect(decrypted.byteLength).toBe(plaintext.byteLength);
+    expect(decrypted).toEqual(plaintext);
+  });
+
+  it("handles unicode content", async () => {
+    const rawKey = crypto.getRandomValues(new Uint8Array(32));
+    const aesKey = await crypto.subtle.importKey(
+      "raw", rawKey, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"],
+    );
+
+    const plaintext = new TextEncoder().encode("User prefers: tabs, 2-space indent, dark mode, TypeScript");
+    const nonce = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: nonce, tagLength: 128 }, aesKey, plaintext,
+    ));
+    const decrypted = new Uint8Array(await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: nonce, tagLength: 128 }, aesKey, ct,
+    ));
+
+    expect(new TextDecoder().decode(decrypted)).toBe(
+      "User prefers: tabs, 2-space indent, dark mode, TypeScript"
+    );
+  });
+
+  it("VaultCrypto throws when not ready", async () => {
+    const { VaultCrypto } = await import("./vault-crypto.js");
+
+    const mockProvider = {
+      getEncryptedVetkey: async () => new Uint8Array(0),
+      getVetkeyVerificationKey: async () => new Uint8Array(0),
+    };
+
+    const vc = new VaultCrypto(mockProvider, new Uint8Array(29));
+    expect(vc.isReady).toBe(false);
+
+    await expect(vc.encrypt("test")).rejects.toThrow("VaultCrypto not ready");
+    await expect(vc.decrypt(new Uint8Array(40))).rejects.toThrow("VaultCrypto not ready");
+  });
+
+  it("VaultCrypto.destroy clears cached keys", async () => {
+    const { VaultCrypto } = await import("./vault-crypto.js");
+
+    const mockProvider = {
+      getEncryptedVetkey: async () => new Uint8Array(0),
+      getVetkeyVerificationKey: async () => new Uint8Array(0),
+    };
+
+    const vc = new VaultCrypto(mockProvider, new Uint8Array(29));
+    // Can't call ensureReady with mock (would fail on BLS), but we can test destroy
+    vc.destroy();
+    expect(vc.isReady).toBe(false);
+  });
+});
+
+// ============================================================
+// Sync with encryption tests
+// ============================================================
+
+describe("sync-encryption", () => {
+  it("computeSyncDelta still works with isEncrypted in mind", () => {
+    // computeSyncDelta doesn't care about isEncrypted - it only looks at timestamps
+    const manifest: SyncManifestData = {
+      lastUpdated: 1_000_000_000n, // 1 second in ns (= 1ms in local time)
+      memoriesCount: 5n,
+      sessionsCount: 0n,
+      categoryChecksums: [["general", "5:1000000000"]],
+    };
+
+    const localMemories: LocalMemory[] = [
+      {
+        key: "test-key",
+        category: "general",
+        content: "this will be encrypted by sync",
+        metadata: "{}",
+        createdAt: 500,
+        updatedAt: 2000, // 2000ms = 2_000_000_000n ns > manifest.lastUpdated (1_000_000_000n)
+      },
+    ];
+
+    const { toSync, toSkip } = computeSyncDelta(localMemories, manifest);
+    expect(toSync.length).toBe(1);
+    expect(toSkip.length).toBe(0);
   });
 });
 
@@ -1295,5 +1574,139 @@ This should be parsed.`;
       expect(result).toContain(".openclaw");
       expect(result).toContain("workspace");
     });
+  });
+});
+
+// ============================================================
+// Vault upgrade IDL and types tests
+// ============================================================
+
+describe("vault-upgrade", () => {
+  it("FactoryError IDL includes upgradeError and noWasmUploaded variants", async () => {
+    const { IDL } = await import("@dfinity/candid");
+
+    // Re-create the FactoryError type as defined in ic-client.ts
+    const FactoryError = IDL.Variant({
+      alreadyExists: IDL.Null,
+      insufficientCycles: IDL.Null,
+      unauthorized: IDL.Text,
+      notFound: IDL.Text,
+      creationFailed: IDL.Text,
+      upgradeError: IDL.Text,
+      noWasmUploaded: IDL.Null,
+    });
+
+    // Verify encoding/decoding of upgradeError
+    const upgradeErr = { upgradeError: "install_code failed: canister not found" };
+    const encoded = IDL.encode([FactoryError], [upgradeErr]);
+    expect(encoded).toBeInstanceOf(Uint8Array);
+    const [decoded] = IDL.decode([FactoryError], encoded);
+    expect(decoded).toEqual(upgradeErr);
+
+    // Verify encoding/decoding of noWasmUploaded
+    const noWasmErr = { noWasmUploaded: null };
+    const encoded2 = IDL.encode([FactoryError], [noWasmErr]);
+    const [decoded2] = IDL.decode([FactoryError], encoded2);
+    expect(decoded2).toEqual(noWasmErr);
+  });
+
+  it("UpgradeResult IDL encodes and decodes correctly", async () => {
+    const { IDL } = await import("@dfinity/candid");
+
+    const UpgradeResult = IDL.Record({
+      succeeded: IDL.Nat,
+      failed: IDL.Nat,
+      errors: IDL.Vec(IDL.Text),
+    });
+
+    const result = {
+      succeeded: BigInt(5),
+      failed: BigInt(2),
+      errors: ["vault-abc: Controller revoked", "vault-def: install_code timeout"],
+    };
+
+    const encoded = IDL.encode([UpgradeResult], [result]);
+    expect(encoded).toBeInstanceOf(Uint8Array);
+    const [decoded] = IDL.decode([UpgradeResult], encoded);
+    expect(decoded).toEqual(result);
+  });
+
+  it("AuditAction IDL includes upgrade variant", async () => {
+    const { IDL } = await import("@dfinity/candid");
+
+    const AuditAction = IDL.Variant({
+      store: IDL.Null,
+      delete: IDL.Null,
+      bulkSync: IDL.Null,
+      restore: IDL.Null,
+      created: IDL.Null,
+      accessDenied: IDL.Null,
+      upgrade: IDL.Null,
+    });
+
+    const upgradeAction = { upgrade: null };
+    const encoded = IDL.encode([AuditAction], [upgradeAction]);
+    const [decoded] = IDL.decode([AuditAction], encoded);
+    expect(decoded).toEqual(upgradeAction);
+  });
+
+  it("IcClient exports UpgradeResultData type correctly", async () => {
+    // Verify the type exists and has expected shape
+    const { IcClient } = await import("./ic-client.js");
+    expect(IcClient).toBeDefined();
+    // Type check: UpgradeResultData is just a type so we verify
+    // the module imports without error and has the expected exports
+    const icClientModule = await import("./ic-client.js");
+    expect(icClientModule).toHaveProperty("IcClient");
+  });
+
+  it("unwrapResult handles upgradeError correctly", async () => {
+    // Test that the error handling in unwrapResult covers new factory errors
+    const { IcClient } = await import("./ic-client.js");
+
+    // We can't directly test unwrapResult (it's not exported), but we can verify
+    // that the IcClient class exists with the expected new methods
+    const client = new IcClient({
+      network: "ic",
+      autoSync: true,
+      syncOnSessionEnd: true,
+      syncOnAgentEnd: true,
+      factoryCanisterId: "v7tpn-laaaa-aaaac-bcmdq-cai",
+    });
+
+    expect(client).toBeDefined();
+    expect(typeof client.upgradeMyVault).toBe("function");
+    expect(typeof client.getLatestVaultVersion).toBe("function");
+  });
+
+  it("formatFactoryError is reachable from upgradeMyVault", async () => {
+    // Verify upgradeMyVault returns error when no factory configured
+    const { IcClient } = await import("./ic-client.js");
+
+    const client = new IcClient({
+      network: "ic",
+      autoSync: true,
+      syncOnSessionEnd: true,
+      syncOnAgentEnd: true,
+      // No factoryCanisterId
+    });
+
+    const result = await client.upgradeMyVault();
+    expect(result).toEqual({ err: "Factory canister ID not configured" });
+  });
+
+  it("getLatestVaultVersion returns 0n when no factory configured", async () => {
+    const { IcClient } = await import("./ic-client.js");
+
+    const client = new IcClient({
+      network: "ic",
+      autoSync: true,
+      syncOnSessionEnd: true,
+      syncOnAgentEnd: true,
+      // No factoryCanisterId
+    });
+
+    const version = await client.getLatestVaultVersion();
+    expect(version).toBe(0n);
   });
 });

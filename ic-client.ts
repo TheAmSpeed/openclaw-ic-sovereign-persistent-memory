@@ -18,6 +18,7 @@ const AuditAction = IDL.Variant({
   restore: IDL.Null,
   created: IDL.Null,
   accessDenied: IDL.Null,
+  upgrade: IDL.Null,
 });
 
 const AuditEntry = IDL.Record({
@@ -36,6 +37,7 @@ const MemoryEntry = IDL.Record({
   metadata: IDL.Text,
   createdAt: IDL.Int,
   updatedAt: IDL.Int,
+  isEncrypted: IDL.Bool,
 });
 
 const SessionEntry = IDL.Record({
@@ -77,6 +79,7 @@ const VaultError = IDL.Variant({
   unauthorized: IDL.Null,
   notFound: IDL.Null,
   invalidInput: IDL.Text,
+  vetKeyError: IDL.Text,
 });
 
 const FactoryError = IDL.Variant({
@@ -85,6 +88,8 @@ const FactoryError = IDL.Variant({
   unauthorized: IDL.Text,
   notFound: IDL.Text,
   creationFailed: IDL.Text,
+  upgradeError: IDL.Text,
+  noWasmUploaded: IDL.Null,
 });
 
 const MemoryInput = IDL.Record({
@@ -94,6 +99,7 @@ const MemoryInput = IDL.Record({
   metadata: IDL.Text,
   createdAt: IDL.Int,
   updatedAt: IDL.Int,
+  isEncrypted: IDL.Bool,
 });
 
 const SessionInput = IDL.Record({
@@ -122,6 +128,14 @@ const ResultOkDashboard = IDL.Variant({ ok: DashboardData, err: VaultError });
 const ResultOkMemories = IDL.Variant({ ok: IDL.Vec(MemoryEntry), err: VaultError });
 const ResultOkSessions = IDL.Variant({ ok: IDL.Vec(SessionEntry), err: VaultError });
 const ResultOkManifest = IDL.Variant({ ok: SyncManifest, err: VaultError });
+const ResultOkBlob = IDL.Variant({ ok: IDL.Vec(IDL.Nat8), err: VaultError });
+
+// VaultVersion type
+const VaultVersion = IDL.Record({
+  version: IDL.Nat,
+  supportsEncryption: IDL.Bool,
+});
+const ResultOkVaultVersion = IDL.Variant({ ok: VaultVersion, err: VaultError });
 
 // Factory Result types
 const ResultOkFactoryVaults = IDL.Variant({
@@ -130,24 +144,35 @@ const ResultOkFactoryVaults = IDL.Variant({
 });
 const ResultOkFactoryUnit = IDL.Variant({ ok: IDL.Null, err: FactoryError });
 
+const UpgradeResult = IDL.Record({
+  succeeded: IDL.Nat,
+  failed: IDL.Nat,
+  errors: IDL.Vec(IDL.Text),
+});
+const ResultOkUpgradeResult = IDL.Variant({ ok: UpgradeResult, err: FactoryError });
+
 // -- IDL factories --
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- InterfaceFactory param type from @dfinity/candid
 const userVaultIdlFactory = ({ IDL: _IDL }: any) => {
   return IDL.Service({
     // Update calls
-    store: IDL.Func([IDL.Text, IDL.Text, IDL.Vec(IDL.Nat8), IDL.Text], [ResultOkUnit], []),
+    store: IDL.Func([IDL.Text, IDL.Text, IDL.Vec(IDL.Nat8), IDL.Text, IDL.Bool], [ResultOkUnit], []),
     delete: IDL.Func([IDL.Text], [ResultOkUnit], []),
     bulkSync: IDL.Func([IDL.Vec(MemoryInput), IDL.Vec(SessionInput)], [ResultOkSyncResult], []),
     storeSession: IDL.Func([IDL.Text, IDL.Vec(IDL.Nat8), IDL.Int, IDL.Int], [ResultOkUnit], []),
-    // Query calls (now return Result types)
+    // VetKey endpoints (update calls for consensus-verified security)
+    getEncryptedVetkey: IDL.Func([IDL.Vec(IDL.Nat8)], [ResultOkBlob], []),
+    getVetkeyVerificationKey: IDL.Func([], [ResultOkBlob], []),
+    // Query calls (return Result types)
     recall: IDL.Func([IDL.Text], [ResultOkOptMemory], ["query"]),
     getStats: IDL.Func([], [ResultOkStats], ["query"]),
     getCategories: IDL.Func([], [ResultOkCategories], ["query"]),
     getAuditLog: IDL.Func([IDL.Nat, IDL.Nat], [ResultOkAuditEntries], ["query"]),
     getAuditLogSize: IDL.Func([], [ResultOkNat], ["query"]),
     getOwner: IDL.Func([], [ResultOkPrincipalVault], ["query"]),
-    // Composite queries (now return Result types)
+    getVaultVersion: IDL.Func([], [ResultOkVaultVersion], ["query"]),
+    // Composite queries (return Result types)
     getDashboard: IDL.Func([], [ResultOkDashboard], ["composite_query"]),
     recallRelevant: IDL.Func(
       [IDL.Opt(IDL.Text), IDL.Opt(IDL.Text), IDL.Nat],
@@ -165,12 +190,17 @@ const factoryIdlFactory = ({ IDL: _IDL }: any) => {
     createVault: IDL.Func([], [ResultOkPrincipal], []),
     transferController: IDL.Func([], [ResultOkFactoryUnit], []),
     revokeFactoryController: IDL.Func([], [ResultOkFactoryUnit], []),
+    upgradeMyVault: IDL.Func([], [ResultOkFactoryUnit], []),
     claimAdmin: IDL.Func([], [ResultOkFactoryUnit], []),
     adminRegisterVault: IDL.Func([IDL.Principal, IDL.Principal], [ResultOkFactoryUnit], []),
+    adminUploadVaultWasm: IDL.Func([IDL.Vec(IDL.Nat8), IDL.Nat], [ResultOkFactoryUnit], []),
+    adminUpgradeVault: IDL.Func([IDL.Principal], [ResultOkFactoryUnit], []),
+    adminUpgradeAllVaults: IDL.Func([], [ResultOkUpgradeResult], []),
     getAdmin: IDL.Func([], [IDL.Opt(IDL.Principal)], ["query"]),
     getVault: IDL.Func([], [IDL.Opt(IDL.Principal)], ["query"]),
     getTotalCreated: IDL.Func([], [IDL.Nat], ["query"]),
     getAllVaults: IDL.Func([], [ResultOkFactoryVaults], ["query"]),
+    getLatestVaultVersion: IDL.Func([], [IDL.Nat], ["query"]),
   });
 };
 
@@ -183,6 +213,7 @@ export interface MemoryEntryData {
   metadata: string;
   createdAt: bigint;
   updatedAt: bigint;
+  isEncrypted: boolean;
 }
 
 export interface SessionEntryData {
@@ -220,6 +251,17 @@ export interface SyncResultData {
   errors: string[];
 }
 
+export interface VaultVersionData {
+  version: bigint;
+  supportsEncryption: boolean;
+}
+
+export interface UpgradeResultData {
+  succeeded: bigint;
+  failed: bigint;
+  errors: string[];
+}
+
 export interface AuditEntryData {
   timestamp: bigint;
   action:
@@ -228,7 +270,8 @@ export interface AuditEntryData {
     | { bulkSync: null }
     | { restore: null }
     | { created: null }
-    | { accessDenied: null };
+    | { accessDenied: null }
+    | { upgrade: null };
   caller: Principal;
   key: [] | [string];
   category: [] | [string];
@@ -247,9 +290,12 @@ function unwrapResult<T>(result: { ok: T } | { err: unknown }, context: string):
     if ("unauthorized" in err) throw new Error(`${context}: Unauthorized -- you are not the vault owner`);
     if ("notFound" in err) throw new Error(`${context}: Not found`);
     if ("invalidInput" in err) throw new Error(`${context}: Invalid input -- ${(err as { invalidInput: string }).invalidInput}`);
+    if ("vetKeyError" in err) throw new Error(`${context}: VetKey error -- ${(err as { vetKeyError: string }).vetKeyError}`);
     if ("alreadyExists" in err) throw new Error(`${context}: Already exists`);
     if ("insufficientCycles" in err) throw new Error(`${context}: Insufficient cycles`);
     if ("creationFailed" in err) throw new Error(`${context}: Creation failed -- ${(err as { creationFailed: string }).creationFailed}`);
+    if ("upgradeError" in err) throw new Error(`${context}: Upgrade failed -- ${(err as { upgradeError: string }).upgradeError}`);
+    if ("noWasmUploaded" in err) throw new Error(`${context}: No vault WASM has been uploaded to the Factory yet`);
   }
   throw new Error(`${context}: Unknown error`);
 }
@@ -395,6 +441,40 @@ export class IcClient {
     return { err: "Unknown error" };
   }
 
+  /// Trigger upgrade of the caller's vault to the latest WASM.
+  /// Requires that the Factory is still a controller of the vault.
+  async upgradeMyVault(): Promise<{ ok: null } | { err: string }> {
+    const agent = await this.getAgent();
+    if (!this.config.factoryCanisterId) {
+      return { err: "Factory canister ID not configured" };
+    }
+
+    const factory = Actor.createActor(factoryIdlFactory, {
+      agent,
+      canisterId: this.config.factoryCanisterId,
+    });
+
+    const result = (await factory.upgradeMyVault()) as
+      | { ok: null }
+      | { err: unknown };
+
+    if ("ok" in result) return { ok: null };
+    return { err: this.formatFactoryError(result.err) };
+  }
+
+  /// Get the latest vault WASM version from the Factory.
+  async getLatestVaultVersion(): Promise<bigint> {
+    const agent = await this.getAgent();
+    if (!this.config.factoryCanisterId) return 0n;
+
+    const factory = Actor.createActor(factoryIdlFactory, {
+      agent,
+      canisterId: this.config.factoryCanisterId,
+    });
+
+    return (await factory.getLatestVaultVersion()) as bigint;
+  }
+
   // -- Vault methods --
 
   /// Store a memory entry.
@@ -403,9 +483,10 @@ export class IcClient {
     category: string,
     content: Uint8Array,
     metadata: string,
+    isEncrypted = false,
   ): Promise<{ ok: null } | { err: string }> {
     const actor = await this.getVaultActor();
-    const result = (await actor.store(key, category, content, metadata)) as
+    const result = (await actor.store(key, category, content, metadata, isEncrypted)) as
       | { ok: null }
       | { err: { unauthorized: null } | { invalidInput: string } };
 
@@ -443,6 +524,7 @@ export class IcClient {
       metadata: string;
       createdAt: bigint;
       updatedAt: bigint;
+      isEncrypted: boolean;
     }>,
     sessions: Array<{
       sessionId: string;
@@ -544,6 +626,38 @@ export class IcClient {
     return unwrapResult(result, "getCategories");
   }
 
+  // -- VetKey methods (for encryption) --
+
+  /// Request an encrypted vetKey from the canister. The canister proxies to the
+  /// IC management canister's vetkd_derive_key API. The returned key is encrypted
+  /// under the provided transport public key. Unwraps Result.
+  async getEncryptedVetkey(transportPublicKey: Uint8Array): Promise<Uint8Array> {
+    const actor = await this.getVaultActor();
+    const result = (await actor.getEncryptedVetkey(transportPublicKey)) as
+      | { ok: Uint8Array }
+      | { err: unknown };
+    return unwrapResult(result, "getEncryptedVetkey");
+  }
+
+  /// Get the vetKey verification key (derived public key) for this canister.
+  /// Used to verify decrypted vetKeys. Unwraps Result.
+  async getVetkeyVerificationKey(): Promise<Uint8Array> {
+    const actor = await this.getVaultActor();
+    const result = (await actor.getVetkeyVerificationKey()) as
+      | { ok: Uint8Array }
+      | { err: unknown };
+    return unwrapResult(result, "getVetkeyVerificationKey");
+  }
+
+  /// Get vault version info. Unwraps Result.
+  async getVaultVersion(): Promise<VaultVersionData> {
+    const actor = await this.getVaultActor();
+    const result = (await actor.getVaultVersion()) as
+      | { ok: VaultVersionData }
+      | { err: unknown };
+    return unwrapResult(result, "getVaultVersion");
+  }
+
   // -- Internal helpers --
 
   private async getAgent(): Promise<HttpAgent> {
@@ -569,11 +683,26 @@ export class IcClient {
   }
 
   private formatVaultError(
-    err: { unauthorized: null } | { notFound: null } | { invalidInput: string },
+    err: { unauthorized: null } | { notFound: null } | { invalidInput: string } | { vetKeyError: string },
   ): string {
     if ("unauthorized" in err) return "Unauthorized: you are not the vault owner";
     if ("notFound" in err) return "Not found";
     if ("invalidInput" in err) return `Invalid input: ${err.invalidInput}`;
+    if ("vetKeyError" in err) return `VetKey error: ${err.vetKeyError}`;
+    return "Unknown error";
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Factory error variants are dynamic
+  private formatFactoryError(err: any): string {
+    if (err && typeof err === "object") {
+      if ("unauthorized" in err) return `Unauthorized: ${err.unauthorized}`;
+      if ("notFound" in err) return `Not found: ${err.notFound}`;
+      if ("alreadyExists" in err) return "Already exists";
+      if ("insufficientCycles" in err) return "Insufficient cycles";
+      if ("creationFailed" in err) return `Creation failed: ${err.creationFailed}`;
+      if ("upgradeError" in err) return `Upgrade failed: ${err.upgradeError}`;
+      if ("noWasmUploaded" in err) return "No vault WASM has been uploaded to the Factory yet";
+    }
     return "Unknown error";
   }
 }

@@ -1,7 +1,9 @@
 /// Differential sync logic for IC Sovereign Persistent Memory.
 /// Compares local state with IC vault and syncs only what's changed.
+/// Supports optional E2E encryption via VaultCrypto (vetKeys).
 
 import type { IcClient, SyncManifestData } from "./ic-client.js";
+import type { VaultCrypto } from "./vault-crypto.js";
 
 export interface LocalMemory {
   key: string;
@@ -88,11 +90,13 @@ export function computeSyncDelta(
 const BATCH_SIZE = 100;
 
 /// Perform a full sync of local memories and sessions to the IC vault.
+/// If `crypto` is provided and ready, content is encrypted client-side before upload.
 export async function performSync(
   client: IcClient,
   localMemories: LocalMemory[],
   localSessions: LocalSession[],
   onProgress?: (msg: string) => void,
+  crypto?: VaultCrypto,
 ): Promise<{
   totalStored: number;
   totalSkipped: number;
@@ -131,18 +135,47 @@ export async function performSync(
 
   onProgress?.(`Syncing ${toSync.length} memories and ${localSessions.length} sessions...`);
 
+  const useEncryption = crypto?.isReady === true;
+
   // Batch sync memories
   for (let i = 0; i < toSync.length; i += BATCH_SIZE) {
     const batch = toSync.slice(i, i + BATCH_SIZE);
 
-    const memoryInputs = batch.map((m) => ({
-      key: m.key,
-      category: m.category,
-      content: encodeContent(m.content),
-      metadata: m.metadata,
-      createdAt: msToNs(m.createdAt),
-      updatedAt: msToNs(m.updatedAt),
-    }));
+    const memoryInputs: Array<{
+      key: string;
+      category: string;
+      content: Uint8Array;
+      metadata: string;
+      createdAt: bigint;
+      updatedAt: bigint;
+      isEncrypted: boolean;
+    }> = [];
+    for (const m of batch) {
+      const plainBytes = encodeContent(m.content);
+      let content: Uint8Array;
+      let encrypted = false;
+      if (useEncryption) {
+        try {
+          content = await crypto!.encrypt(plainBytes);
+          encrypted = true;
+        } catch {
+          // Encryption failed for this entry — fall back to plaintext.
+          // This prevents a single entry's failure from dropping the entire batch.
+          content = plainBytes;
+        }
+      } else {
+        content = plainBytes;
+      }
+      memoryInputs.push({
+        key: m.key,
+        category: m.category,
+        content,
+        metadata: m.metadata,
+        createdAt: msToNs(m.createdAt),
+        updatedAt: msToNs(m.updatedAt),
+        isEncrypted: encrypted,
+      });
+    }
 
     // Only include sessions in the first batch
     const sessionInputs =
@@ -178,7 +211,11 @@ export async function performSync(
       endedAt: msToNs(s.endedAt),
     }));
 
-    const result = await client.bulkSync([], sessionInputs);
+    // Sessions are not encrypted (they contain structural data, not user secrets)
+    const result = await client.bulkSync(
+      [],
+      sessionInputs,
+    );
     if ("ok" in result) {
       totalStored += Number(result.ok.stored);
       totalSkipped += Number(result.ok.skipped);
@@ -197,9 +234,11 @@ export async function performSync(
 
 /// Restore all memories and sessions from the IC vault.
 /// Uses paginated getSessions to restore ALL sessions (not just dashboard's recent 5).
+/// If `crypto` is provided and ready, encrypted content is decrypted client-side.
 export async function restoreFromVault(
   client: IcClient,
   onProgress?: (msg: string) => void,
+  crypto?: VaultCrypto,
 ): Promise<{
   memories: LocalMemory[];
   sessions: LocalSession[];
@@ -222,10 +261,32 @@ export async function restoreFromVault(
   for (const cat of categories) {
     const entries = await client.recallRelevant(cat, null, memoriesLimit);
     for (const entry of entries) {
+      let contentBytes = entry.content;
+      let contentText: string;
+
+      if (entry.isEncrypted) {
+        if (crypto?.isReady) {
+          try {
+            contentBytes = await crypto.decrypt(contentBytes);
+            contentText = decodeContent(contentBytes);
+          } catch {
+            // Decryption failed (wrong key, corrupted data, tampered ciphertext).
+            // Skip this entry rather than abort the entire restore.
+            contentText = "[encrypted — decryption failed]";
+          }
+        } else {
+          // Encrypted entry but no crypto available — mark it rather than
+          // producing garbled text from decoding raw ciphertext bytes.
+          contentText = "[encrypted — decryption key unavailable]";
+        }
+      } else {
+        contentText = decodeContent(contentBytes);
+      }
+
       allMemories.push({
         key: entry.key,
         category: entry.category,
-        content: decodeContent(entry.content),
+        content: contentText,
         metadata: entry.metadata,
         createdAt: nsToMs(entry.createdAt),
         updatedAt: nsToMs(entry.updatedAt),

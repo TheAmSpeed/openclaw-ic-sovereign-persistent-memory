@@ -1,6 +1,6 @@
 {
   "name": "openclaw-ic-sovereign-persistent-memory",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "description": "Sovereign, persistent AI memory on the Internet Computer. Your memories live in a personal canister that only you control -- across devices, forever.",
   "type": "module",
   "main": "./index.ts",
@@ -12,6 +12,7 @@
     "memory-reader.ts",
     "prompts.ts",
     "sync.ts",
+    "vault-crypto.ts",
     "openclaw.plugin.json",
     "skills/"
   ],
@@ -51,15 +52,17 @@
   },
   "homepage": "https://github.com/TheAmSpeed/openclaw-ic-sovereign-persistent-memory#readme",
   "dependencies": {
-    "@dfinity/agent": "^2.3.0",
-    "@dfinity/candid": "^2.3.0",
-    "@dfinity/identity": "^2.3.0",
-    "@dfinity/principal": "^2.3.0",
+    "@dfinity/agent": "^3.4.3",
+    "@dfinity/candid": "^3.4.3",
+    "@dfinity/identity": "^3.4.3",
+    "@dfinity/principal": "^3.4.3",
+    "@dfinity/vetkeys": "^0.4.0",
     "@sinclair/typebox": "^0.34.0"
   },
   "devDependencies": {
     "openclaw": "^2026.2.15",
     "oxlint": "^0.16.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   },

@@ -5,6 +5,7 @@ import { Type } from "@sinclair/typebox";
 import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { parseConfig, icStorageConfigSchema, type IcStorageConfig } from "./config.js";
 import { IcClient } from "./ic-client.js";
+import { VaultCrypto } from "./vault-crypto.js";
 import {
   identityExists,
   generateAndSaveIdentity,
@@ -54,6 +55,7 @@ const icStoragePlugin = {
     }
 
     let client: IcClient | null = null;
+    let crypto: VaultCrypto | null = null;
 
     // Lazy-init the IC client
     function getClient(): IcClient {
@@ -61,6 +63,26 @@ const icStoragePlugin = {
         client = new IcClient(cfg);
       }
       return client;
+    }
+
+    // Lazy-init and derive the vetKey encryption engine.
+    // First call makes two IC update calls (~2-3 seconds). Subsequent calls are instant.
+    async function getCrypto(): Promise<VaultCrypto> {
+      if (crypto?.isReady) return crypto;
+
+      const ic = getClient();
+      // Ensure the agent is initialized so we have the principal
+      await ic.initAgent();
+      const principal = ic.getPrincipal();
+      if (!principal) {
+        throw new Error("No IC identity available for encryption. Run `openclaw ic-memory setup` first.");
+      }
+
+      if (!crypto) {
+        crypto = new VaultCrypto(ic, principal.toUint8Array());
+      }
+      await crypto.ensureReady();
+      return crypto;
     }
 
     // -- Tools --
@@ -99,7 +121,8 @@ const icStoragePlugin = {
               }),
             );
 
-            const result = await performSync(getClient(), localMemories, []);
+            const vaultCrypto = await getCrypto().catch(() => undefined);
+            const result = await performSync(getClient(), localMemories, [], undefined, vaultCrypto);
             return {
               content: [
                 {
@@ -145,6 +168,18 @@ const icStoragePlugin = {
           try {
             const ic = getClient();
 
+            // Initialize decryption if needed
+            const decryptEntry = async (content: Uint8Array, isEncrypted: boolean): Promise<string> => {
+              if (!isEncrypted) return decodeContent(content);
+              try {
+                const vaultCrypto = await getCrypto();
+                const plain = await vaultCrypto.decrypt(content);
+                return decodeContent(plain);
+              } catch {
+                return "[encrypted -- decryption failed]";
+              }
+            };
+
             // Exact key recall
             if (params.key) {
               const entry = await ic.recall(params.key);
@@ -155,11 +190,12 @@ const icStoragePlugin = {
                   ],
                 };
               }
+              const contentText = await decryptEntry(entry.content, entry.isEncrypted);
               return {
                 content: [
                   {
                     type: "text" as const,
-                    text: `[${entry.category}] ${entry.key}: ${decodeContent(entry.content)}`,
+                    text: `[${entry.category}] ${entry.key}: ${contentText}`,
                   },
                 ],
                 details: {
@@ -185,9 +221,12 @@ const icStoragePlugin = {
               };
             }
 
-            const text = entries
-              .map((e) => `[${e.category}] ${e.key}: ${decodeContent(e.content)}`)
-              .join("\n");
+            const textParts: string[] = [];
+            for (const e of entries) {
+              const contentText = await decryptEntry(e.content, e.isEncrypted);
+              textParts.push(`[${e.category}] ${e.key}: ${contentText}`);
+            }
+            const text = textParts.join("\n");
 
             return {
               content: [{ type: "text" as const, text }],
@@ -219,7 +258,8 @@ const icStoragePlugin = {
         parameters: Type.Object({}),
         async execute() {
           try {
-            const result = await restoreFromVault(getClient());
+            const vaultCrypto = await getCrypto().catch(() => undefined);
+            const result = await restoreFromVault(getClient(), undefined, vaultCrypto);
             return {
               content: [
                 {
@@ -414,7 +454,7 @@ const icStoragePlugin = {
         const { categories, prefixes } = deriveSearchTerms(prompt);
 
         // Recall relevant memories from IC vault
-        const recalled: Array<{ key: string; category: string; content: Uint8Array }> = [];
+        const recalled: Array<{ key: string; category: string; content: Uint8Array; isEncrypted: boolean }> = [];
         const RECALL_LIMIT = 10;
 
         if (categories.length > 0) {
@@ -432,15 +472,43 @@ const icStoragePlugin = {
 
         if (recalled.length === 0) return;
 
-        // Deduplicate by key
-        const seen = new Set<string>();
-        const unique = recalled.filter((m) => {
-          if (seen.has(m.key)) return false;
-          seen.add(m.key);
-          return true;
-        });
+        // Decrypt encrypted entries if any
+        const hasEncrypted = recalled.some((m) => m.isEncrypted);
+        let vaultCrypto: VaultCrypto | null = null;
+        if (hasEncrypted) {
+          try {
+            vaultCrypto = await getCrypto();
+          } catch (err) {
+            api.logger.error(
+              `IC Sovereign Memory: failed to derive decryption key: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            // Continue with plaintext entries only
+          }
+        }
 
-        const context = formatMemoriesAsContext(unique);
+        // Deduplicate by key and decrypt encrypted entries
+        const seen = new Set<string>();
+        const decrypted: Array<{ key: string; category: string; content: Uint8Array }> = [];
+        for (const m of recalled) {
+          if (seen.has(m.key)) continue;
+          seen.add(m.key);
+
+          let content = m.content;
+          if (m.isEncrypted && vaultCrypto?.isReady) {
+            try {
+              content = await vaultCrypto.decrypt(content);
+            } catch {
+              // Skip entries we can't decrypt (key mismatch, corruption)
+              continue;
+            }
+          } else if (m.isEncrypted) {
+            // Can't decrypt -- skip encrypted entries when crypto isn't available
+            continue;
+          }
+          decrypted.push({ key: m.key, category: m.category, content });
+        }
+
+        const context = formatMemoriesAsContext(decrypted);
         if (!context) return;
 
         return { prependContext: context };
@@ -462,7 +530,8 @@ const icStoragePlugin = {
         if (!identityExists()) return;
         try {
           const localMemories = readLocalMemories();
-          await performSync(getClient(), localMemories, []);
+          const vaultCrypto = await getCrypto().catch(() => undefined);
+          await performSync(getClient(), localMemories, [], undefined, vaultCrypto);
         } catch (err) {
           api.logger.error(
             `IC Sovereign Memory: session_end sync failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -499,7 +568,8 @@ const icStoragePlugin = {
 
         if (allMemories.length === 0) return;
 
-        await performSync(getClient(), allMemories, []);
+        const vaultCrypto = await getCrypto().catch(() => undefined);
+        await performSync(getClient(), allMemories, [], undefined, vaultCrypto);
       } catch (err) {
         api.logger.error(
           `IC Sovereign Memory: before_compaction sync failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -551,7 +621,8 @@ const icStoragePlugin = {
 
           const allMemories = [...localMemories, ...messageMemories];
 
-          await performSync(getClient(), allMemories, []);
+          const vaultCrypto = await getCrypto().catch(() => undefined);
+          await performSync(getClient(), allMemories, [], undefined, vaultCrypto);
         } catch (err) {
           api.logger.error(
             `IC Sovereign Memory: agent_end sync failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -669,12 +740,24 @@ const icStoragePlugin = {
                 `  Last sync:   ${s.lastUpdated === 0n ? "never" : new Date(Number(s.lastUpdated / 1_000_000n)).toISOString()}`,
               );
 
+              // Show encryption status
+              const encryptedCount = dashboard.recentMemories.filter((m) => m.isEncrypted).length;
+              const totalRecent = dashboard.recentMemories.length;
+              if (totalRecent > 0) {
+                const encPct = Math.round((encryptedCount / totalRecent) * 100);
+                console.log(`  Encryption: ${encPct}% of recent entries encrypted`);
+              }
+
               if (dashboard.recentMemories.length > 0) {
                 console.log("");
                 console.log("  Recent memories:");
                 for (const m of dashboard.recentMemories.slice(0, 5)) {
-                  const preview = decodeContent(m.content).slice(0, 60);
-                  console.log(`    [${m.category}] ${m.key}: ${preview}${preview.length >= 60 ? "..." : ""}`);
+                  if (m.isEncrypted) {
+                    console.log(`    [${m.category}] ${m.key}: [encrypted]`);
+                  } else {
+                    const preview = decodeContent(m.content).slice(0, 60);
+                    console.log(`    [${m.category}] ${m.key}: ${preview}${preview.length >= 60 ? "..." : ""}`);
+                  }
                 }
               }
               console.log("");
@@ -704,9 +787,19 @@ const icStoragePlugin = {
                 return;
               }
 
+              let vaultCrypto: VaultCrypto | undefined;
+              try {
+                console.log("  Initializing end-to-end encryption...");
+                vaultCrypto = await getCrypto();
+                console.log("  Encryption ready.");
+              } catch (err) {
+                console.log(`  Warning: encryption unavailable (${err instanceof Error ? err.message : String(err)})`);
+                console.log("  Syncing without encryption (plaintext).");
+              }
+
               const result = await performSync(getClient(), localMemories, [], (msg) =>
                 console.log(`    ${msg}`),
-              );
+              vaultCrypto);
               console.log("");
               console.log(`  Done: ${result.totalStored} stored, ${result.totalSkipped} unchanged`);
               if (result.errors.length > 0) {
@@ -725,7 +818,17 @@ const icStoragePlugin = {
             try {
               console.log("");
               console.log("  Restoring from IC vault...");
-              const result = await restoreFromVault(getClient(), (msg) => console.log(`    ${msg}`));
+              let vaultCrypto: VaultCrypto | undefined;
+              try {
+                console.log("  Initializing end-to-end encryption...");
+                vaultCrypto = await getCrypto();
+                console.log("  Encryption ready.");
+              } catch (err) {
+                console.log(`  Warning: decryption unavailable (${err instanceof Error ? err.message : String(err)})`);
+                console.log("  Restoring plaintext entries only.");
+              }
+
+              const result = await restoreFromVault(getClient(), (msg) => console.log(`    ${msg}`), vaultCrypto);
               console.log("");
               console.log(`  Restored ${result.memories.length} memories and ${result.sessions.length} sessions`);
               console.log("  Your sovereign memories are now available on this device.");
@@ -860,6 +963,260 @@ const icStoragePlugin = {
           });
 
         vault
+          .command("migrate-encrypt")
+          .description("Encrypt existing plaintext memories in your vault (one-time migration)")
+          .action(async () => {
+            try {
+              console.log("");
+              console.log("  IC Sovereign Persistent Memory -- Encrypt Existing Memories");
+              console.log("  -----------------------------------------------------------");
+              console.log("");
+              console.log("  This will read all plaintext memories from your vault,");
+              console.log("  encrypt them client-side using vetKeys, and write them back.");
+              console.log("  After migration, node providers cannot read your memory content.");
+              console.log("");
+
+              if (!cfg.canisterId) {
+                console.error("  No vault configured. Run `openclaw ic-memory setup` first.");
+                return;
+              }
+              if (!identityExists()) {
+                console.error("  No IC identity found. Run `openclaw ic-memory setup` first.");
+                return;
+              }
+
+              const ic = getClient();
+              const dashboard = await ic.getDashboard();
+              const totalMemories = Number(dashboard.stats.totalMemories);
+
+              if (totalMemories === 0) {
+                console.log("  Your vault is empty. Nothing to migrate.");
+                console.log("");
+                return;
+              }
+
+              // Count unencrypted entries
+              const categories = await ic.getCategories();
+              let plaintextCount = 0;
+              let encryptedCount = 0;
+              const allPlaintextEntries: Array<{
+                key: string;
+                category: string;
+                content: Uint8Array;
+                metadata: string;
+                createdAt: bigint;
+                updatedAt: bigint;
+              }> = [];
+
+              for (const cat of categories) {
+                const entries = await ic.recallRelevant(cat, null, totalMemories);
+                for (const entry of entries) {
+                  if (entry.isEncrypted) {
+                    encryptedCount++;
+                  } else {
+                    plaintextCount++;
+                    allPlaintextEntries.push(entry);
+                  }
+                }
+              }
+
+              console.log(`  Found ${plaintextCount} plaintext and ${encryptedCount} already encrypted.`);
+
+              if (plaintextCount === 0) {
+                console.log("  All memories are already encrypted. Nothing to do.");
+                console.log("");
+                return;
+              }
+
+              // Confirm
+              console.log("");
+              console.log(`  Will encrypt ${plaintextCount} plaintext entries.`);
+              console.log("");
+
+              const readline = await import("node:readline");
+              const rl = readline.createInterface({
+                input: process.stdin,
+                output: process.stdout,
+              });
+
+              const answer = await new Promise<string>((resolve) => {
+                rl.question("  Proceed? (y/N): ", (ans) => {
+                  rl.close();
+                  resolve(ans);
+                });
+              });
+
+              if (answer.trim().toLowerCase() !== "y") {
+                console.log("");
+                console.log("  Migration cancelled.");
+                console.log("");
+                return;
+              }
+
+              // Initialize encryption
+              console.log("");
+              console.log("  Deriving encryption key from IC vetKeys...");
+              const vaultCrypto = await getCrypto();
+              console.log("  Encryption ready.");
+
+              // Encrypt and re-upload in batches
+              let migrated = 0;
+              const BATCH = 50;
+              for (let i = 0; i < allPlaintextEntries.length; i += BATCH) {
+                const batch = allPlaintextEntries.slice(i, i + BATCH);
+                const encryptedInputs = [];
+
+                for (const entry of batch) {
+                  const encrypted = await vaultCrypto.encrypt(entry.content);
+                  encryptedInputs.push({
+                    key: entry.key,
+                    category: entry.category,
+                    content: encrypted,
+                    metadata: entry.metadata,
+                    createdAt: entry.createdAt,
+                    updatedAt: entry.updatedAt,
+                    isEncrypted: true,
+                  });
+                }
+
+                const result = await ic.bulkSync(encryptedInputs, []);
+                if ("ok" in result) {
+                  migrated += Number(result.ok.stored);
+                } else {
+                  console.error(`  Batch error: ${result.err}`);
+                }
+                console.log(`  Encrypted ${migrated}/${plaintextCount} entries...`);
+              }
+
+              // Post-migration verification: re-check how many remain plaintext
+              let remainingPlaintext = 0;
+              for (const cat of categories) {
+                const entries = await ic.recallRelevant(cat, null, totalMemories);
+                for (const entry of entries) {
+                  if (!entry.isEncrypted) remainingPlaintext++;
+                }
+              }
+
+              console.log("");
+              console.log(`  Migration complete: ${migrated} entries encrypted.`);
+              if (remainingPlaintext > 0) {
+                console.log(`  WARNING: ${remainingPlaintext} entries still plaintext (batch errors during migration).`);
+                console.log("  Run `openclaw ic-memory migrate-encrypt` again to retry.");
+              } else {
+                console.log("  All entries are now encrypted.");
+              }
+              console.log("  Your vault data is now protected by end-to-end encryption.");
+              console.log("  Node providers can no longer read your memory content.");
+              console.log("");
+            } catch (err) {
+              console.error(`  Migration failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          });
+
+        vault
+          .command("upgrade-vault")
+          .description("Upgrade your vault canister to the latest version")
+          .action(async () => {
+            try {
+              console.log("");
+              console.log("  IC Sovereign Persistent Memory -- Vault Upgrade");
+              console.log("  -----------------------------------------------");
+              console.log("");
+
+              if (!cfg.canisterId) {
+                console.error("  No vault configured. Run `openclaw ic-memory setup` first.");
+                return;
+              }
+              if (!identityExists()) {
+                console.error("  No IC identity found. Run `openclaw ic-memory setup` first.");
+                return;
+              }
+
+              const ic = getClient();
+
+              // Check current vault version
+              console.log("  Checking vault version...");
+              let vaultVersion: bigint;
+              try {
+                const versionInfo = await ic.getVaultVersion();
+                vaultVersion = versionInfo.version;
+                console.log(`  Current vault version: ${vaultVersion}`);
+              } catch {
+                // Vault may be on v1 which doesn't have getVaultVersion
+                vaultVersion = 1n;
+                console.log("  Current vault version: 1 (pre-encryption)");
+              }
+
+              // Check latest version from Factory
+              const latestVersion = await ic.getLatestVaultVersion();
+              console.log(`  Latest available version: ${latestVersion}`);
+
+              if (latestVersion === 0n) {
+                console.log("");
+                console.log("  No vault WASM has been uploaded to the Factory yet.");
+                console.log("  The admin must upload the latest WASM before upgrades are available.");
+                console.log("");
+                return;
+              }
+
+              if (vaultVersion >= latestVersion) {
+                console.log("");
+                console.log("  Your vault is already up to date.");
+                console.log("");
+                return;
+              }
+
+              console.log("");
+              console.log(`  An upgrade is available: v${vaultVersion} -> v${latestVersion}`);
+              console.log("  This will upgrade your vault canister's code while preserving all data.");
+              console.log("  The Factory must still be a controller of your vault for this to work.");
+              console.log("");
+
+              const readline = await import("node:readline");
+              const rl = readline.createInterface({
+                input: process.stdin,
+                output: process.stdout,
+              });
+
+              const answer = await new Promise<string>((resolve) => {
+                rl.question("  Proceed with upgrade? (y/N): ", (ans) => {
+                  rl.close();
+                  resolve(ans);
+                });
+              });
+
+              if (answer.trim().toLowerCase() !== "y") {
+                console.log("");
+                console.log("  Upgrade cancelled.");
+                console.log("");
+                return;
+              }
+
+              console.log("");
+              console.log("  Upgrading vault...");
+              const result = await ic.upgradeMyVault();
+              if ("ok" in result) {
+                console.log("  Vault upgraded successfully.");
+                // Verify the new version
+                try {
+                  const newVersionInfo = await ic.getVaultVersion();
+                  console.log(`  New vault version: ${newVersionInfo.version}`);
+                  if (newVersionInfo.supportsEncryption) {
+                    console.log("  Encryption support: enabled");
+                  }
+                } catch {
+                  // Non-critical -- version check failed but upgrade succeeded
+                }
+              } else {
+                console.error(`  Upgrade failed: ${result.err}`);
+              }
+              console.log("");
+            } catch (err) {
+              console.error(`  Upgrade failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          });
+
+        vault
           .command("delete-identity")
           .description("Delete your IC identity from this device (DESTRUCTIVE)")
           .action(async () => {
@@ -923,10 +1280,37 @@ const icStoragePlugin = {
           api.logger.info(
             `IC Sovereign Memory: active (vault: ${cfg.canisterId}, network: ${cfg.network}, auto-sync: ${cfg.autoSync})`,
           );
+
+          // Background upgrade availability check (non-blocking, best-effort)
+          if (identityExists()) {
+            (async () => {
+              try {
+                const ic = getClient();
+                let vaultVersion: bigint;
+                try {
+                  const versionInfo = await ic.getVaultVersion();
+                  vaultVersion = versionInfo.version;
+                } catch {
+                  vaultVersion = 1n;
+                }
+                const latestVersion = await ic.getLatestVaultVersion();
+                if (latestVersion > 0n && vaultVersion < latestVersion) {
+                  api.logger.info(
+                    `IC Sovereign Memory: vault upgrade available (v${vaultVersion} -> v${latestVersion}). ` +
+                    `Run \`openclaw ic-memory upgrade-vault\` to upgrade.`,
+                  );
+                }
+              } catch {
+                // Silently ignore -- upgrade check is best-effort
+              }
+            })();
+          }
         }
         // If not configured, the gateway_start hook handles messaging
       },
       stop: () => {
+        // Clean up cached encryption key material
+        crypto?.destroy();
         api.logger.info("IC Sovereign Memory: service stopped");
       },
     });
